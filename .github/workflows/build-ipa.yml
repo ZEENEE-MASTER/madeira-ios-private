@@ -28,7 +28,56 @@ permissions:
   contents: read
 
 jobs:
+  # The Xcode project copies app/Madeira/x86_64-vcruntime in as a resource and it
+  # is gitignored -- Microsoft redistributables, so upstream documents fetching
+  # them (tools/fetch-vcruntime.md) rather than committing them.
+  #
+  # That doc's route does not work any more: it points at .rsrc/1033/CABINET/*.cab,
+  # but VC_redist.x64.exe is now a WiX burn bundle that 7-Zip will not unpack --
+  # a 25 MB installer yields ~590 KB of extensionless stubs and no payload.
+  #
+  # GitHub's Windows runners already carry the redistributable inside Visual
+  # Studio, byte-for-byte as Microsoft shipped it, so take it from there. They
+  # must not be re-signed or have certificates stripped: FEX runs this as real
+  # x86 code.
+  vcruntime:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Collect the x64 CRT from the installed Visual Studio redist
+        shell: pwsh
+        run: |
+          $wanted = @(
+            'concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll',
+            'msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcamp140.dll',
+            'vccorlib140.dll','vcomp140.dll','vcruntime140.dll',
+            'vcruntime140_1.dll','vcruntime140_threads.dll'
+          )
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $roots = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Redist\MSVC' -Directory -ErrorAction SilentlyContinue
+          if (-not $roots) { Write-Error 'no VC Redist directory on this runner'; exit 1 }
+          foreach ($name in $wanted) {
+            $hit = Get-ChildItem -Path $roots.FullName -Recurse -Filter $name -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+            if ($hit) {
+              Copy-Item $hit.FullName -Destination "out\$name"
+              '{0,-32} {1,10} bytes' -f $name, $hit.Length
+            } else {
+              "MISSING  $name"
+            }
+          }
+          $got = (Get-ChildItem out).Count
+          "collected $got of $($wanted.Count)"
+          if ($got -lt 10) { Write-Error "only $got DLLs found - the runner image layout changed"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: out/
+          retention-days: 1
+
   ipa:
+    needs: vcruntime
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -81,35 +130,19 @@ jobs:
       #   error: lstat(app/Madeira/x86_64-vcruntime): No such file or directory
       # They must stay byte-for-byte as Microsoft shipped them: no re-signing,
       # no stripping certificates.
-      - name: Fetch Microsoft VC++ x64 runtime
+      - name: Bring in the x64 CRT built by the windows job
+        uses: actions/download-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: app/Madeira/x86_64-vcruntime
+
+      - name: Verify the CRT landed
         run: |
           set -euo pipefail
-          brew install --quiet sevenzip
-          curl -fsSL -o /tmp/VC_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-          7zz x -y -o/tmp/vcredist /tmp/VC_redist.x64.exe > /dev/null
-          mkdir -p app/Madeira/x86_64-vcruntime
-          # tools/fetch-vcruntime.md points at .rsrc/1033/CABINET/*.cab, but the
-          # current redistributable extracts to extensionless payloads (u1..u29),
-          # so find the cab by CONTENT rather than by name.
-          FOUND=""
-          for candidate in /tmp/vcredist/*; do
-            [ -f "$candidate" ] || continue
-            if 7zz l "$candidate" 2>/dev/null | grep -qi 'vcruntime140\.dll'; then
-              echo "payload containing the runtime: $candidate"
-              7zz x -y -oapp/Madeira/x86_64-vcruntime "$candidate" > /dev/null
-              FOUND=1
-            fi
-          done
-          if [ -z "$FOUND" ]; then
-            echo "::error::no payload inside VC_redist.x64.exe contained vcruntime140.dll"
-            echo "--- extracted from the outer exe ---"
-            ls -la /tmp/vcredist | head -40
-            exit 1
-          fi
-          echo "extracted $(ls app/Madeira/x86_64-vcruntime | wc -l | tr -d ' ') files:"
-          ls app/Madeira/x86_64-vcruntime | sed 's/^/  /'
+          echo "$(ls app/Madeira/x86_64-vcruntime | wc -l | tr -d ' ') files:"
+          ls -l app/Madeira/x86_64-vcruntime | sed 's/^/  /'
           for want in concrt140.dll msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
-            [ -f "app/Madeira/x86_64-vcruntime/$want" ] || echo "::warning::expected $want not found"
+            [ -f "app/Madeira/x86_64-vcruntime/$want" ] || { echo "::error::$want missing"; exit 1; }
           done
 
       - name: Build (unsigned)
