@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       submodules:
-        description: "Check out wine/FEX/dxmt submodules (slow, ~1.2 GB, only needed to rebuild them)"
+        description: "Check out wine/FEX/dxmt submodules (needed for headers; only turn off to test a cache)"
         type: boolean
-        default: false
+        default: true
       configuration:
         description: "Xcode configuration"
         type: choice
@@ -85,11 +85,28 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # Submodules are NOT optional. The committed .a files cover the LINK, but
+      # app/Madeira/FEXBridge.mm includes FEXCore headers at COMPILE time:
+      #   'FEXCore/Config/Config.h' file not found
+      # fetch-depth 1 keeps the submodule clones shallow -- wine alone is ~1.1 GB
+      # of history otherwise.
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          submodules: ${{ inputs.submodules == false && 'false' || 'recursive' }}
           fetch-depth: 1
+
+      - name: Submodule sizes
+        run: |
+          for d in FEX wine research/dxmt; do
+            if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then
+              printf '  %-16s %s
+' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+            else
+              printf '  %-16s NOT CHECKED OUT
+' "$d"
+            fi
+          done
 
       - name: Select the newest Xcode and check the SDK
         run: |
