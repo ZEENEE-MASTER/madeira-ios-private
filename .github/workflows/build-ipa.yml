@@ -78,7 +78,10 @@ jobs:
 
   ipa:
     needs: vcruntime
-    runs-on: macos-15
+    # ContentView.swift uses .glassEffect(.regular), which is the iOS 26 Liquid
+    # Glass API -- so this needs Xcode 26 and the iOS 26 SDK. macos-15's default
+    # Xcode is older and fails with "no member 'glassEffect'".
+    runs-on: macos-latest
     timeout-minutes: 90
 
     steps:
@@ -88,12 +91,26 @@ jobs:
           submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
           fetch-depth: 1
 
-      - name: Toolchain versions
+      - name: Select the newest Xcode and check the SDK
         run: |
+          set -euo pipefail
+          echo "Xcodes on this image:"
+          ls -d /Applications/Xcode*.app 2>/dev/null | sed 's/^/  /' || echo "  (none beyond the default)"
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST"
+            echo "selected: $NEWEST"
+          fi
           echo "Xcode:    $(xcodebuild -version | head -1)"
-          echo "iOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version)"
-          echo "SDK path: $(xcrun --sdk iphoneos --show-sdk-path)"
+          SDKV="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iOS SDK:  $SDKV"
           echo "clang:    $(xcrun --sdk iphoneos clang --version | head -1)"
+          # app/Madeira/ContentView.swift calls .glassEffect(.regular), iOS 26+.
+          MAJOR="${SDKV%%.*}"
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "::error::iOS SDK $SDKV is too old - ContentView.swift needs the iOS 26 SDK for .glassEffect(). No Xcode 26 on this runner image."
+            exit 1
+          fi
 
       # What the project actually offers. If the build below picks the wrong
       # scheme, this output is where the right name comes from.
