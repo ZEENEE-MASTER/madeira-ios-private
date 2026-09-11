@@ -99,14 +99,13 @@ jobs:
       - name: Submodule sizes
         run: |
           for d in FEX wine research/dxmt; do
-            if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then
-              printf '  %-16s %s
-' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+            if [ -e "$d/.git" ]; then
+              echo "  $d  $(du -sh "$d" 2>/dev/null | cut -f1)"
             else
-              printf '  %-16s NOT CHECKED OUT
-' "$d"
+              echo "  $d  NOT CHECKED OUT"
             fi
           done
+          echo "  FEXCore/Config/Config.h present: $([ -f FEX/FEXCore/include/FEXCore/Config/Config.h ] && echo yes || echo no)"
 
       - name: Select the newest Xcode and check the SDK
         run: |
