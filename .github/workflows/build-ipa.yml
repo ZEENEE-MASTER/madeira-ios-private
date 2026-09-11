@@ -87,10 +87,25 @@ jobs:
           brew install --quiet sevenzip
           curl -fsSL -o /tmp/VC_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
           7zz x -y -o/tmp/vcredist /tmp/VC_redist.x64.exe > /dev/null
-          CAB="$(find /tmp/vcredist -iname '*.cab' | head -1)"
-          [ -n "$CAB" ] || { echo "::error::no .cab inside the redistributable"; find /tmp/vcredist -maxdepth 3 | head -40; exit 1; }
           mkdir -p app/Madeira/x86_64-vcruntime
-          7zz x -y -oapp/Madeira/x86_64-vcruntime "$CAB" > /dev/null
+          # tools/fetch-vcruntime.md points at .rsrc/1033/CABINET/*.cab, but the
+          # current redistributable extracts to extensionless payloads (u1..u29),
+          # so find the cab by CONTENT rather than by name.
+          FOUND=""
+          for candidate in /tmp/vcredist/*; do
+            [ -f "$candidate" ] || continue
+            if 7zz l "$candidate" 2>/dev/null | grep -qi 'vcruntime140\.dll'; then
+              echo "payload containing the runtime: $candidate"
+              7zz x -y -oapp/Madeira/x86_64-vcruntime "$candidate" > /dev/null
+              FOUND=1
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::no payload inside VC_redist.x64.exe contained vcruntime140.dll"
+            echo "--- extracted from the outer exe ---"
+            ls -la /tmp/vcredist | head -40
+            exit 1
+          fi
           echo "extracted $(ls app/Madeira/x86_64-vcruntime | wc -l | tr -d ' ') files:"
           ls app/Madeira/x86_64-vcruntime | sed 's/^/  /'
           for want in concrt140.dll msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
