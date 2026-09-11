@@ -1,0 +1,140 @@
+name: Build Madeira IPA
+
+# You build on Windows; Madeira needs Xcode. This runs the app build on a macOS
+# runner and hands back an unsigned IPA as a private, expiring artifact.
+#
+# It deliberately does NOT rebuild Wine, FEX or DXMT by default. 236 prebuilt
+# binaries are already committed in-tree (the Wine DLLs, libdxmt_unix.a,
+# libwineserver.a), and build/dxmt-ios/build.sh expects a custom LLVM-for-iOS
+# under toolchains/ that is not in the repo at all. So the fast path is: build
+# the Xcode app against what is already there.
+#
+# Nothing is published. The artifact is private to this repo and expires.
+
+on:
+  workflow_dispatch:
+    inputs:
+      submodules:
+        description: "Check out wine/FEX/dxmt submodules (slow, ~1.2 GB, only needed to rebuild them)"
+        type: boolean
+        default: false
+      configuration:
+        description: "Xcode configuration"
+        type: choice
+        options: [Release, Debug]
+        default: Release
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules && 'recursive' || 'false' }}
+          fetch-depth: 1
+
+      - name: Toolchain versions
+        run: |
+          echo "Xcode:    $(xcodebuild -version | head -1)"
+          echo "iOS SDK:  $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "SDK path: $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "clang:    $(xcrun --sdk iphoneos clang --version | head -1)"
+
+      # What the project actually offers. If the build below picks the wrong
+      # scheme, this output is where the right name comes from.
+      - name: Discover schemes and targets
+        id: discover
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project app/Madeira.xcodeproj | tee /tmp/list.txt
+          SCHEME="$(awk '/Schemes:/{f=1;next} f && NF {print $1; exit}' /tmp/list.txt)"
+          [ -n "$SCHEME" ] || SCHEME=Madeira
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Using scheme: $SCHEME"
+
+      # Confirm the prebuilt libraries the app links against are present. If any
+      # of these are missing the link will fail with something far less obvious.
+      - name: Check committed prebuilt artifacts
+        run: |
+          set -euo pipefail
+          missing=0
+          for lib in app/libdxmt_unix.a app/Madeira/libwineserver.a; do
+            if [ -f "$lib" ]; then
+              printf '  present  %-40s %s\n' "$lib" "$(du -h "$lib" | cut -f1)"
+            else
+              printf '  MISSING  %s\n' "$lib"; missing=1
+            fi
+          done
+          echo "  Windows DLLs: $(find app/Madeira -name '*.dll' | wc -l | tr -d ' ')"
+          [ "$missing" -eq 0 ] || echo "::warning::a prebuilt library is missing; the link step may fail"
+
+      - name: Build (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme "${{ steps.discover.outputs.scheme }}" \
+            -configuration "${{ inputs.configuration }}" \
+            -sdk iphoneos \
+            -derivedDataPath build-out \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_BITCODE=NO \
+            build 2>&1 | tee /tmp/xcodebuild.log | xcbeautify || {
+              echo "::error::build failed - see the xcodebuild-log artifact"
+              tail -80 /tmp/xcodebuild.log
+              exit 1
+            }
+
+      # get-task-allow is what lets StikDebug attach and grant JIT. Without it
+      # FEX cannot generate code and nothing runs. The memory entitlements are
+      # the ones this device actually honours - the CP2077 work confirmed
+      # extended-virtual-addressing is live (maps landing at ~456 GB).
+      - name: Write sideloading entitlements
+        run: |
+          cat > entitlements.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>get-task-allow</key><true/>
+            <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          cat entitlements.plist
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$(find build-out/Build/Products -maxdepth 2 -name '*.app' -print -quit)"
+          [ -n "$APP" ] || { echo "::error::no .app was produced"; find build-out -maxdepth 4 -type d | head -40; exit 1; }
+          echo "app bundle: $APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          cp entitlements.plist Payload/
+          zip -qry "Madeira-${GITHUB_RUN_NUMBER}.ipa" Payload
+          ls -lh "Madeira-${GITHUB_RUN_NUMBER}.ipa"
+
+      - name: Upload IPA (private, expires)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-ipa-${{ github.run_number }}
+          path: Madeira-*.ipa
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.run_number }}
+          path: /tmp/xcodebuild.log
+          retention-days: 7
