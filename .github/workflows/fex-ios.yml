@@ -83,6 +83,12 @@ jobs:
         run: |
           set -euo pipefail
           command -v ninja >/dev/null 2>&1 || brew install ninja
+          # FEX/Scripts/aarch64_fit_native.py does 'from pkg_resources import
+          # parse_version'. pkg_resources ships with setuptools, which Python
+          # 3.12+ no longer installs by default -- the script then dies, prints
+          # nothing, and CMakeLists.txt:510 string(STRIP) gets an empty argument.
+          python3 -m pip install --quiet --break-system-packages setuptools 2>/dev/null \n            || python3 -m pip install --quiet setuptools
+          python3 -c 'import pkg_resources; print("pkg_resources OK")'
           cmake -S FEX -B FEX/build-ios -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/fex-ios/toolchain_ios.cmake"             -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}"             -DCMAKE_BUILD_TYPE=Release             -DBUILD_TESTING=OFF             -DBUILD_FEX_LINUX_TESTS=OFF             -DENABLE_JEMALLOC=OFF             -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF             -DENABLE_FEX_ALLOCATOR=OFF             -DENABLE_LTO=OFF             2>&1 | tail -40
 
       # Whether or not the libraries build, a successful configure has already
