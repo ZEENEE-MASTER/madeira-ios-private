@@ -136,6 +136,11 @@ jobs:
         if: ${{ inputs.stage != '1' }}
         run: |
           set -euo pipefail
+          # build/freetype-ios/build.sh exits with "clone freetype first";
+          # its header names the exact command.
+          if [ ! -d research/freetype ]; then
+            git clone --depth 1 --branch VER-2-13-3               https://github.com/freetype/freetype.git research/freetype
+          fi
           for s in gnutls-ios freetype-ios; do
             echo "=== build/$s ==="
             if [ -x "build/$s/build.sh" ] || [ -f "build/$s/build.sh" ]; then
@@ -146,6 +151,15 @@ jobs:
           done
           echo "--- toolchains/ ---"
           ls -la toolchains 2>/dev/null | sed 's/^/  /' || echo "  (toolchains/ not created)"
+
+      - name: "Stage 3: ntdll-unix and win32u-unix"
+        if: ${{ inputs.stage == '3' || inputs.stage == '4' }}
+        run: |
+          set -euo pipefail
+          for s in ntdll-unix win32u-unix; do
+            echo "=== build/$s ==="
+            bash "build/$s/build.sh" 2>&1 | tail -25 || echo "::warning::$s failed"
+          done
 
       - name: Report what exists so far
         if: always()
