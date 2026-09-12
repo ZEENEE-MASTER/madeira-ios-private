@@ -1,0 +1,118 @@
+name: Build LLVM 15 for iOS (DXMT prerequisite)
+
+# Step 4 of the missing-libraries chain. libdxmt_combined.a is the last of the
+# four the app links and cannot otherwise be produced, because
+# build/dxmt-ios/build.sh needs:
+#
+#   LLVM_SRC="$REPO_ROOT/toolchains/llvm-project/llvm"
+#   LLVM_BUILD="$REPO_ROOT/toolchains/llvm-ios-build"
+#
+# and toolchains/ is empty in a clean checkout.
+#
+# build/dxmt-ios/README.md documents exactly what this needs, which I did not
+# read until late:
+#
+#   "LLVM 15.0.7 cross-built for iOS-aarch64 at toolchains/llvm-ios-build/.
+#    Two-stage build -- first llvm-tblgen for macOS host, then iOS target libs
+#    reusing it. Host stage: vanilla Release build of llvm-tblgen. iOS stage:
+#    CMAKE_SYSTEM_NAME=iOS, CMAKE_OSX_SYSROOT=iphoneos,
+#    LLVM_TABLEGEN=<host tblgen>, LLVM_BUILD_UTILS=Off, no targets. Needs a
+#    one-line edit to llvm/cmake/modules/AddLLVM.cmake changing
+#    MATCHES "Darwin" to MATCHES "Darwin|iOS" so -dead_strip is used instead
+#    of --gc-sections (which Apple ld doesn't accept)."
+#
+# That AddLLVM.cmake edit is the same class of problem as FEX's LinkerGC.cmake:
+# a GNU-only linker flag applied on a platform whose linker rejects it.
+#
+# The result is cached, because this is the slowest build in the project and
+# nothing about it changes between runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_tag:
+        description: "llvm-project tag"
+        default: "llvmorg-15.0.7"
+
+permissions:
+  contents: read
+
+jobs:
+  llvm:
+    runs-on: macos-latest
+    timeout-minutes: 350
+    steps:
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST"; fi
+          xcodebuild -version | head -1
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          cmake --version | head -1
+
+      - name: Cache the iOS LLVM build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/llvm-ios-build
+          key: llvm-ios-${{ inputs.llvm_tag }}-v1
+
+      - name: Clone llvm-project
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          git clone --depth 1 --branch "${{ inputs.llvm_tag }}" \
+            https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          cd toolchains/llvm-project && git log --oneline -1
+
+      # Apple's ld takes -dead_strip, not --gc-sections. AddLLVM.cmake gates
+      # that choice on Darwin only, so an iOS build gets the GNU flag and fails
+      # at link. Exactly the LinkerGC.cmake problem FEX had.
+      - name: Patch AddLLVM.cmake for iOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          F=toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          before=$(grep -c 'MATCHES "Darwin|iOS"' "$F" || true)
+          if [ "$before" -gt 0 ]; then
+            echo "already patched"
+          else
+            perl -pi -e 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/g' "$F"
+            echo "patched $(grep -c 'MATCHES "Darwin\|iOS"' "$F") occurrence(s)"
+          fi
+          grep -n 'MATCHES "Darwin' "$F" | head -5 | sed 's/^/  /'
+
+      # Stage 1: llvm-tblgen for the HOST. The iOS stage cannot run tblgen
+      # itself (it would be an iOS binary), so it is handed this one.
+      - name: "Host stage: llvm-tblgen"
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF 2>&1 | tail -12
+          cmake --build toolchains/llvm-host-build --parallel "$(sysctl -n hw.ncpu)" --target llvm-tblgen 2>&1 | tail -12
+          ls -lh toolchains/llvm-host-build/bin/llvm-tblgen
+
+      # Stage 2: the iOS target libraries, reusing the host tblgen.
+      - name: "iOS stage: target libraries"
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          TBLGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release -DLLVM_TABLEGEN="$TBLGEN" -DLLVM_BUILD_UTILS=Off -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF 2>&1 | tail -15
+          cmake --build toolchains/llvm-ios-build --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tail -25
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          echo "=== iOS LLVM libraries ==="
+          N=$(find toolchains/llvm-ios-build -name '*.a' 2>/dev/null | wc -l | tr -d ' ')
+          echo "  static libs: $N"
+          find toolchains/llvm-ios-build -name 'libLLVMCore.a' -o -name 'libLLVMSupport.a' 2>/dev/null | sed 's/^/  /' | head -5
+          echo "=== generated headers DXMT includes (-I llvm-ios-build/include) ==="
+          for h in include/llvm/Config/llvm-config.h include/llvm/Config/abi-breaking.h; do
+            if [ -f "toolchains/llvm-ios-build/$h" ]; then echo "  OK      $h"; else echo "  MISSING $h"; fi
+          done
+          if [ "$N" -eq 0 ]; then echo "::error::no LLVM static libraries produced"; exit 1; fi
+          du -sh toolchains/llvm-ios-build | sed 's/^/  total: /'
