@@ -160,6 +160,17 @@ jobs:
             echo "=== build/$s ==="
             bash "build/$s/build.sh" 2>&1 | tail -25 || echo "::warning::$s failed"
           done
+          # win32u writes per-module .err files; the summary only names which
+          # modules failed, not why. Show the first errors from a few of them.
+          if [ -d build/win32u-unix/obj ]; then
+            echo "=== first errors from failed win32u modules ==="
+            for e in build/win32u-unix/obj/class.err build/win32u-unix/obj/window.err build/win32u-unix/obj/message.err; do
+              if [ -f "$e" ]; then
+                echo "--- $(basename "$e") ---"
+                grep -E 'error:|fatal error:' "$e" | head -5 | sed 's/^/    /'
+              fi
+            done
+          fi
 
       - name: Report what exists so far
         if: always()
