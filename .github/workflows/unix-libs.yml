@@ -119,8 +119,19 @@ jobs:
           # fork's iOS-specific unix side anyway.
           make -j"$(sysctl -n hw.ncpu)" tools 2>&1 | tail -8 || true
           make -j"$(sysctl -n hw.ncpu)" include 2>&1 | tail -8 || true
+          # 'make include' yields only config.h. The IDL-derived headers are
+          # separate targets, and win32u needs them:
+          #   combaseapi.h:29: fatal error: 'objidlbase.h' file not found
+          # Ask for each one explicitly.
+          echo "--- generating IDL headers ---"
+          made=0
+          for idl in ../include/*.idl; do
+            h="include/$(basename "$idl" .idl).h"
+            if make "$h" >/dev/null 2>&1; then made=$((made+1)); fi
+          done
+          echo "  generated $made headers from .idl"
           echo "--- what the unix-lib scripts need ---"
-          for p in include/config.h include/winuser.h dlls/ntdll dlls/win32u; do
+          for p in include/config.h include/objidlbase.h include/combaseapi.h dlls/ntdll dlls/win32u; do
             if [ -e "$p" ]; then echo "  OK      $p"; else echo "  MISSING $p"; fi
           done
           echo "  generated headers in include/: $(find include -name '*.h' | wc -l | tr -d ' ')"
