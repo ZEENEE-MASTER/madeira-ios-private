@@ -1,0 +1,127 @@
+name: Build MoltenVK for iOS
+
+# Tier 2, the only genuinely hard part.
+#
+# The DX12 chain is:
+#   d3d12.dll -> libs/vkd3d -> vulkan-1 -> winevulkan -> Vulkan ICD
+#   (shipped)    (bundled)     (built)     (built)       <- THIS
+#
+# Everything to the left is free and already handled by wine-pe-dlls.yml.
+# The ICD is the missing piece, and on iOS the only Vulkan implementation is
+# MoltenVK, which translates Vulkan -> Metal.
+#
+# MoltenVK is a standalone Khronos project that builds for iOS with Xcode, so
+# unlike everything else in Tier 2 it can be built and verified on its own,
+# without the Madeira app linking. That makes it the one part of Tier 2 that is
+# provable tonight.
+#
+# What this does NOT do: wire it into winevulkan. On Unix, winevulkan's unixlib
+# loads an ICD through the Vulkan loader; on iOS there is no loader and no
+# dlopen of system Vulkan, so MoltenVK has to be linked statically and exposed
+# to winevulkan directly. That integration needs the app to link, which is
+# blocked on FEX. This step produces the library that integration will need.
+#
+# Known ceiling, worth recording: MoltenVK exposes no VK_EXT_mesh_shader and no
+# VK_KHR_ray_tracing_pipeline. Metal has both capabilities; MoltenVK has not
+# surfaced them as Vulkan extensions. So this route reaches D3D12 feature level
+# 12_0/12_1 core and permanently excludes Nanite-class UE5 and DXR titles.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "MoltenVK git ref (tag or branch)"
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  moltenvk:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST"; fi
+          xcodebuild -version | head -1
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Clone MoltenVK
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            https://github.com/KhronosGroup/MoltenVK.git
+          cd MoltenVK
+          echo "MoltenVK $(git log --oneline -1)"
+
+      # Pulls SPIRV-Cross, glslang, SPIRV-Tools, Vulkan-Headers. This is the
+      # slow step; --ios keeps it to the one platform we need.
+      - name: Fetch dependencies (iOS only)
+        working-directory: MoltenVK
+        run: |
+          set -euo pipefail
+          ./fetchDependencies --ios 2>&1 | tail -30
+
+      - name: Build MoltenVK for iOS
+        working-directory: MoltenVK
+        run: |
+          set -euo pipefail
+          make ios 2>&1 | tail -40
+
+      - name: Inspect what was produced
+        working-directory: MoltenVK
+        run: |
+          set -euo pipefail
+          echo "=== Package tree ==="
+          find Package -maxdepth 4 -name "*.xcframework" -o -maxdepth 4 -name "*.a" -o -maxdepth 4 -name "*.dylib" | head -20
+          echo
+          echo "=== the static library we need ==="
+          LIB=$(find Package -name "libMoltenVK.a" | head -1)
+          if [ -z "$LIB" ]; then
+            echo "::error::no libMoltenVK.a produced"
+            find Package -type f | head -40
+            exit 1
+          fi
+          echo "  $LIB  $(du -h "$LIB" | cut -f1)"
+          echo
+          echo "=== architectures (must include ios arm64, NOT simulator) ==="
+          lipo -info "$LIB" || true
+          echo
+          echo "=== does it actually export the Vulkan entry points? ==="
+          for sym in vkCreateInstance vkEnumeratePhysicalDevices vkCreateDevice vkGetInstanceProcAddr; do
+            if nm -g "$LIB" 2>/dev/null | grep -q "_$sym$"; then
+              echo "  OK      $sym"
+            else
+              echo "  MISSING $sym"
+            fi
+          done
+          echo
+          echo "=== extensions MoltenVK advertises (the Tier 2 ceiling) ==="
+          for ext in VK_EXT_mesh_shader VK_KHR_ray_tracing_pipeline VK_KHR_acceleration_structure VK_EXT_descriptor_indexing VK_KHR_buffer_device_address VK_KHR_timeline_semaphore VK_KHR_dynamic_rendering VK_EXT_robustness2 VK_KHR_push_descriptor; do
+            if strings "$LIB" 2>/dev/null | grep -qx "$ext"; then
+              echo "  present  $ext"
+            else
+              echo "  ABSENT   $ext"
+            fi
+          done
+
+      - name: Stage the artifact
+        working-directory: MoltenVK
+        run: |
+          set -euo pipefail
+          mkdir -p ../out
+          find Package -name "libMoltenVK.a" -exec cp {} ../out/ ';'
+          find Package -name "vulkan" -type d -maxdepth 5 | head -1 | while read -r d; do
+            cp -R "$d" ../out/ 2>/dev/null || true
+          done
+          cp -R Package/Release/MoltenVK/include ../out/ 2>/dev/null || true
+          ls -lhR ../out | head -30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moltenvk-ios
+          path: out/
+          retention-days: 7
