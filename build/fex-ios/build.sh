@@ -21,6 +21,14 @@ BUILD="$FEX/build-ios"
 
 [ -d "$FEX/FEXCore" ] || { echo "FEX submodule not checked out: $FEX" >&2; exit 1; }
 
+# Scripts/aarch64_fit_native.py prefers packaging.version and falls back to
+# pkg_resources, which setuptools 81+ removed. Without either, the script emits
+# nothing and CMakeLists.txt:510 string(STRIP) fails on an empty argument.
+python3 -c 'import packaging' 2>/dev/null || {
+  echo "python 'packaging' module missing; install it (brew install python-packaging)" >&2
+  exit 1
+}
+
 GEN=Ninja
 command -v ninja >/dev/null 2>&1 || GEN="Unix Makefiles"
 

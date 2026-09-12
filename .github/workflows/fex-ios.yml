@@ -83,19 +83,16 @@ jobs:
         run: |
           set -euo pipefail
           command -v ninja >/dev/null 2>&1 || brew install ninja
-          # FEX/Scripts/aarch64_fit_native.py does 'from pkg_resources import
-          # parse_version'. pkg_resources ships with setuptools, which Python
-          # 3.12+ no longer installs by default -- the script then dies, prints
-          # nothing, and CMakeLists.txt:510 string(STRIP) gets an empty argument.
-          # Homebrew's python is externally managed (PEP 668), so pip needs
-          # --break-system-packages; brew's own formula is tried first.
-          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
-            brew install python-setuptools || true
-          fi
-          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
-            python3 -m pip install --user --break-system-packages setuptools || true
-          fi
-          python3 -c 'import pkg_resources; print("pkg_resources:", pkg_resources.__name__)'
+          # FEX/Scripts/aarch64_fit_native.py does:
+          #   try:    from packaging.version import Version as version_check
+          #   except: from pkg_resources import parse_version as version_check
+          # It PREFERS packaging. pkg_resources was removed in setuptools 81+,
+          # so installing setuptools cannot provide it (84.0.0 installs fine and
+          # the import still fails). Install packaging and the first branch wins.
+          # Without it the script dies, prints nothing, and CMakeLists.txt:510
+          # string(STRIP) is handed an empty argument.
+          python3 -c 'import packaging' 2>/dev/null             || brew install python-packaging             || python3 -m pip install --user --break-system-packages packaging
+          python3 -c 'import packaging.version; print("packaging", packaging.version.__name__, "OK")'
           cmake -S FEX -B FEX/build-ios -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/fex-ios/toolchain_ios.cmake"             -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}"             -DCMAKE_BUILD_TYPE=Release             -DBUILD_TESTING=OFF             -DBUILD_FEX_LINUX_TESTS=OFF             -DENABLE_JEMALLOC=OFF             -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF             -DENABLE_FEX_ALLOCATOR=OFF             -DENABLE_LTO=OFF             2>&1 | tail -40
 
       # Whether or not the libraries build, a successful configure has already

@@ -187,12 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v ninja >/dev/null 2>&1 || brew install ninja
-          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
-            brew install python-setuptools || true
-          fi
-          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
-            python3 -m pip install --user --break-system-packages setuptools || true
-          fi
+          python3 -c 'import packaging' 2>/dev/null             || brew install python-packaging             || python3 -m pip install --user --break-system-packages packaging
           git submodule update --init --depth 1 --recursive FEX 2>&1 | tail -5 || true
           bash build/fex-ios/build.sh 2>&1 | tail -30
 
