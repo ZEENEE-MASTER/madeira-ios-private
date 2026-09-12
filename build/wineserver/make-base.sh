@@ -79,7 +79,7 @@ if [ "$fail" -gt 0 ]; then
   echo "--- first errors ---"
   for n in $failed_names; do
     echo "  $n:"
-    grep -E 'error:|fatal error:' "$OBJ_DIR/$n.err" | head -3 | sed 's/^/      /'
+    grep -E 'error:|fatal error:' "$OBJ_DIR/$n.err" | head -3 | sed 's/^/      /' || true
   done
 fi
 

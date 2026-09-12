@@ -178,7 +178,7 @@ jobs:
             for e in build/win32u-unix/obj/class.err build/win32u-unix/obj/window.err build/win32u-unix/obj/message.err; do
               if [ -f "$e" ]; then
                 echo "--- $(basename "$e") ---"
-                grep -E 'error:|fatal error:' "$e" | head -5 | sed 's/^/    /'
+                grep -E 'error:|fatal error:' "$e" | head -5 | sed 's/^/    /' || echo "    (no errors - module built)"
               fi
             done
           fi
