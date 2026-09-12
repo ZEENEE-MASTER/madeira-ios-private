@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Build FEXCore for iOS into FEX/build-ios/.
+#
+# The output directory is not a free choice: app/Madeira.xcodeproj hardcodes
+# $(SRCROOT)/../FEX/build-ios in both HEADER_SEARCH_PATHS and
+# LIBRARY_SEARCH_PATHS, and expects
+#
+#   FEX/build-ios/include/FEXCore/Config/ConfigValues.inl   (generated)
+#   FEX/build-ios/FEXCore/Source/libFEXCore.a
+#   FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+#   FEX/build-ios/External/{fmt,cephes,xxhash/cmake_unofficial,SoftFloat-3e}/*.a
+#
+# Upstream has no equivalent of this script; the invocation lived only on the
+# author's machine.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+FEX="$REPO_ROOT/FEX"
+BUILD="$FEX/build-ios"
+
+[ -d "$FEX/FEXCore" ] || { echo "FEX submodule not checked out: $FEX" >&2; exit 1; }
+
+GEN=Ninja
+command -v ninja >/dev/null 2>&1 || GEN="Unix Makefiles"
+
+cmake -S "$FEX" -B "$BUILD" -G "$GEN" \
+  -DCMAKE_TOOLCHAIN_FILE="$HERE/toolchain_ios.cmake" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF \
+  -DBUILD_FEX_LINUX_TESTS=OFF \
+  -DENABLE_JEMALLOC=OFF \
+  -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
+  -DENABLE_FEX_ALLOCATOR=OFF \
+  -DENABLE_LTO=OFF \
+  "$@"
+
+cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
+
+echo "--- produced ---"
+find "$BUILD" -name '*.a' | sed "s|$BUILD/|  |"

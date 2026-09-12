@@ -75,24 +75,15 @@ jobs:
       # build-ios is not a free choice: the Xcode project hardcodes
       # $(SRCROOT)/../FEX/build-ios in HEADER_SEARCH_PATHS and
       # LIBRARY_SEARCH_PATHS.
+      # Uses build/fex-ios/ -- the toolchain file and build script upstream
+      # never had. CMAKE_SYSTEM_PROCESSOR must come from a toolchain file: as a
+      # -D on the command line it is overwritten during iOS platform init,
+      # which is what produced "Unsupported processor type ." twice.
       - name: Configure FEXCore for iOS
-        working-directory: FEX
         run: |
           set -euo pipefail
-          cmake -B build-ios -G Ninja \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF \
-            -DBUILD_FEX_LINUX_TESTS=OFF \
-            -DENABLE_JEMALLOC=OFF \
-            -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
-            -DENABLE_FEX_ALLOCATOR=OFF \
-            -DENABLE_LTO=OFF \
-            2>&1 | tail -40
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S FEX -B FEX/build-ios -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/fex-ios/toolchain_ios.cmake"             -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}"             -DCMAKE_BUILD_TYPE=Release             -DBUILD_TESTING=OFF             -DBUILD_FEX_LINUX_TESTS=OFF             -DENABLE_JEMALLOC=OFF             -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF             -DENABLE_FEX_ALLOCATOR=OFF             -DENABLE_LTO=OFF             2>&1 | tail -40
 
       # Whether or not the libraries build, a successful configure has already
       # produced the two generated headers that blocked the app build at
