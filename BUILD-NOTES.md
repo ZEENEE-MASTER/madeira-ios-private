@@ -1,7 +1,7 @@
 # Build notes (private fork)
 
 What it actually takes to build Madeira from a clean checkout, worked out by
-running it in CI seven times. Upstream has no build documentation beyond
+running it in CI repeatedly. Upstream has no build documentation beyond
 "shell scripts in `build/*/`, app via Xcode", so this is the missing half.
 
 ## Prerequisites, in the order they bite
@@ -14,56 +14,96 @@ running it in CI seven times. Upstream has no build documentation beyond
 | 4 | `no member 'glassEffect'` | `ContentView.swift` uses the iOS 26 Liquid Glass API | Xcode 26 / iOS 26 SDK required |
 | 5 | `'FEXCore/Config/Config.h' file not found` | submodules not checked out | `submodules: recursive` — the committed `.a` files cover the link, not the compile |
 | 6 | `'FEXCore/Config/ConfigValues.inl' file not found` | generated file, not in the tree | see below |
-| 7 | *(not yet reached)* `libFEXCore.a` etc. | **FEX is not prebuilt** | see below |
+| 7 | `libFEXCore.a` not found | FEX is not prebuilt and has no build recipe | **solved** — `build/fex-ios/`, see below |
 
-## The real gate: FEX must be cross-compiled for iOS
+## FEX for iOS — SOLVED
 
-`app/Madeira.xcodeproj` expects a populated `FEX/build-ios/`:
+`app/Madeira.xcodeproj` links `libFEXCore.a` and `libFEXCore_Base.a` from
+`FEX/build-ios/`, and nothing in any repo builds them. I first recorded this as
+"someone has to write that CMake cross-compile, or get the author's." **That was
+wrong.** The FEX fork's own top-level `CMakeLists.txt` says:
 
 ```
-HEADER_SEARCH_PATHS   .../FEX/build-ios
-                      .../FEX/build-ios/include          <- ConfigValues.inl lands here
-                      .../FEX/build-ios/FEXCore/Source
-LIBRARY_SEARCH_PATHS  .../FEX/build-ios/FEXCore/Source   <- libFEXCore.a, libFEXCore_Base.a
-                      .../FEX/build-ios/External/fmt
-                      .../FEX/build-ios/External/cephes
-                      .../FEX/build-ios/External/xxhash/cmake_unofficial
-                      .../FEX/build-ios/External/SoftFloat-3e
+"FEX only supports Linux, Windows, and Darwin/iOS."
+CMAKE_SYSTEM_NAME STREQUAL "iOS"
+
+if (NOT APPLE)
+  # binfmt_misc, Source/, AppConfig     <- skipped on Apple
+endif()
 ```
 
-None of those libraries are committed. The only `.a` files in the repo are
-`libgmp`, `libgnutls`, `libhogweed`, `libnettle` and `libdxmt_unix` — so DXMT,
-wineserver and the crypto stack are prebuilt, **but FEXCore is not**.
+iOS is a supported system, and on Apple it skips `Source/` and builds `FEXCore/`
+alone — exactly the two static libraries the app wants. Only the *invocation*
+was missing. It now lives in `build/fex-ios/`:
 
-There is no `build/fex-ios/build.sh`, and the FEX fork
-(`willfaust/FEX @ ios-port-2607`) has no iOS toolchain file — `Data/CMake/`
-carries `toolchain_aarch64`, `toolchain_mingw`, `toolchain_x86_32`,
-`toolchain_x86_64` and nothing for iOS. It does carry iOS *source*
-(`Source/Windows/ARM64EC/IosJitAlias.cpp`, `IosMonoBridge.h`,
-`Source/Windows/Common/CRT/CRT_iOS.cpp`), so the port is real — the build
-invocation for it is simply not in any repo.
+| file | what it is |
+|---|---|
+| `toolchain_ios.cmake` | the toolchain upstream never had |
+| `build.sh` | the invocation; every other component has one, FEX didn't |
+| `patch-ios-build.py` | two idempotent source fixes |
 
-**Someone has to write that CMake cross-compile, or get the author's.**
+### The six things it needed, and why each is non-obvious
 
-### ConfigValues.inl, for when that happens
+1. **`CMAKE_SYSTEM_PROCESSOR=aarch64` from a toolchain file.** `CMAKE_SYSTEM_NAME=iOS`
+   doesn't populate it, and passing `-DCMAKE_SYSTEM_PROCESSOR` on the command line
+   is *overwritten during iOS platform initialisation*. FEX's first use is
+   `string(TOLOWER ${CMAKE_SYSTEM_PROCESSOR} processor)` — with an empty variable
+   that's a call with no arguments, so you get two errors from one cause:
+   `string no output variable specified` and `Unsupported processor type .`
 
-It is generated during CMake configure, from `FEXCore/Source/CMakeLists.txt`:
+2. **`TUNE_CPU=none`.** FEX defaults to `native` and runs
+   `Scripts/aarch64_fit_native.py /proc/cpuinfo`, which macOS doesn't have. Its own
+   escape hatch is `elseif (NOT TUNE_CPU STREQUAL "none")` at CMakeLists.txt:530.
+   Correct for any cross-compile: the build host's CPU says nothing about the target's.
+
+3. **`-DFEX_IOS_HOST=1`.** Used 14 times in `Core.cpp` alone and **defined in no
+   CMakeLists in the tree** — the author passes it from his own shell. Some
+   declarations sit inside `#ifdef FEX_IOS_HOST` while code using them does not,
+   so without it you get `use of undeclared identifier 'IosFfsBypassLog'`.
+
+4. **Python `packaging` on the build host.** `aarch64_fit_native.py` does
+   `try: from packaging.version import Version / except: from pkg_resources import
+   parse_version`. It *prefers* packaging. `pkg_resources` was removed in
+   setuptools 81+, so installing setuptools cannot supply it — 84.0.0 installs
+   cleanly and the import still fails.
+
+5. **Two source patches** (`patch-ios-build.py`, diagnostics only):
+   * `Arm64.cpp` calls `VirtualQuery` with `MEMORY_BASIC_INFORMATION`/`LPCVOID`
+     inside **no preprocessor guard**, in a file that includes no Windows header.
+     The committed branch therefore cannot compile as checked out — the author has
+     local state, or builds FEX in a Windows-targeting configuration.
+   * `Data/CMake/LinkerGC.cmake` applies `--gc-sections --strip-all --as-needed`
+     in Release with no platform guard; Apple's `ld` takes none of them.
+
+6. **`--target FEXCore FEXCore_Base`.** The `FEXCore_shared` dylib cannot link on
+   iOS — it needs `_ios_fex_mono_*` and `_rpm_cas_snapshot_take` from
+   `Source/Windows/ARM64EC/` (skipped on Apple) and SoftFloat symbols that aren't
+   linked into it. **This is what "failed" for four consecutive runs while
+   `libFEXCore.a` was succeeding at step 168/169 in every one of them.**
+
+### Output
+
+```
+libFEXCore.a           3.9M      libcephes_128bit.a   23K
+libFEXCore_Base.a      124K      libxxhash.a          44K
+libfmt.a               188K      libsoftfloat_3e.a    76K
+```
+
+Note the real filenames: `libcephes_128bit.a` and `libsoftfloat_3e.a`, not
+`libcephes.a` / `libsoftfloat-3e.a`.
+
+### ConfigValues.inl
+
+Generated by an `add_custom_command` at **build** time, not configure — from
+`FEXCore/Source/CMakeLists.txt`:
 
 ```cmake
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Interface/Config/Config.json.in
+configure_file(Interface/Config/Config.json.in
                ${CMAKE_BINARY_DIR}/generated/Config/Config.json)
-
 add_custom_command(
-  OUTPUT "${OUTPUT_CONFIG_NAME}"        # ${CMAKE_BINARY_DIR}/include/FEXCore/Config/ConfigValues.inl
-  OUTPUT "${OUTPUT_CONFIG_OPTION_NAME}" # ${CMAKE_BINARY_DIR}/include/FEXCore/Config/ConfigOptions.inl
-  OUTPUT "${OUTPUT_MAN_NAME}"           # ${CMAKE_BINARY_DIR}/generated/FEX.1
-  COMMAND "python3" ".../Scripts/config_generator.py"
-    "${INPUT_CONFIG_NAME}" "${OUTPUT_CONFIG_NAME}" "${OUTPUT_MAN_NAME}"
-    "${OUTPUT_CONFIG_OPTION_NAME}")
+  OUTPUT ${CMAKE_BINARY_DIR}/include/FEXCore/Config/ConfigValues.inl
+  COMMAND python3 Scripts/config_generator.py ...)
 ```
-
-With `CMAKE_BINARY_DIR = FEX/build-ios`, a configure alone produces the two
-`.inl` files. It does not produce the libraries.
 
 ## Known-good environment
 
