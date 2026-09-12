@@ -227,3 +227,69 @@ winevulkan. On Unix, winevulkan's unixlib reaches an ICD through the Vulkan
 loader. iOS has no loader and no dlopen of a system Vulkan, so MoltenVK must be
 linked statically and handed to winevulkan directly. That needs the FEX gate
 cleared first.
+
+---
+
+# Can an IPA be built from this repository? No.
+
+Not because of a build flag. The app links four static libraries that are **not
+committed and cannot be regenerated from what is here**.
+
+```
+ld: library 'JemallocLibs' not found    -> fixed (FEX target, now built)
+ld: library 'wineserver' not found      -> cannot be fixed from this repo
+```
+
+## What the app links, and where each comes from
+
+| library | source | state |
+|---|---|---|
+| `libFEXCore.a` `libFEXCore_Base.a` `libJemallocLibs.a` `libcephes_128bit.a` `libfmt.a` `libsoftfloat_3e.a` `libxxhash.a` | `FEX/build-ios/` | **solved** — `build/fex-ios/` |
+| `libgmp.a` `libgnutls.a` `libhogweed.a` `libnettle.a` | committed in `app/Madeira/` | fine |
+| `libntdll_unix.a` `libwin32u_unix.a` `libwineserver.a` `libdxmt_combined.a` | *nowhere* | **blocked** |
+
+## Why the last row cannot be produced
+
+Each build script depends on artifacts absent from the repository:
+
+* `build/ntdll-unix/build.sh` — `wine/build-macos` (a macOS Wine build tree) and
+  `toolchains/gnutls-ios`
+* `build/win32u-unix/build.sh` — `wine/build-macos`, and freetype from `toolchains/`
+* `build/dxmt-ios/build.sh` — `toolchains/llvm-project` and `toolchains/llvm-ios-build`,
+  a custom LLVM cross-built for iOS
+* `build/wineserver/build.sh` — the hard one:
+
+```bash
+APP_LIB="$REPO_ROOT/app/Madeira/libwineserver.a"
+if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
+    if [ -f "$APP_LIB" ]; then
+        cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
+    else
+        echo "ERROR: No base libwineserver.a found"
+        exit 1
+    fi
+fi
+```
+
+It **replaces objects inside an existing archive** and has no path to creating
+one. The base archive is not in the repo.
+
+`toolchains/` contains zero entries here; `wine/build-macos` is a build output
+that was never committed. Note also that only `libdxmt_unix.a` is committed
+while the project links `libdxmt_combined.a` — a different file.
+
+## What it would take
+
+1. Build Wine for **macOS** to produce `wine/build-macos` (feasible — the PE
+   cross-build already works, see `wine-pe-dlls.yml`)
+2. Run `build/gnutls-ios/build.sh` and `build/freetype-ios/build.sh` to populate
+   `toolchains/`
+3. Cross-build LLVM for iOS into `toolchains/llvm-ios-build` (large, but
+   mechanical)
+4. Then `ntdll-unix`, `win32u-unix`, `dxmt-ios`
+5. `wineserver` remains genuinely unclear — its script cannot bootstrap its own
+   base archive, so either that base has to come out of the macOS Wine build, or
+   the script needs rewriting
+
+Steps 1–4 are a substantial but tractable chain. Step 5 is the one that may need
+the author.
