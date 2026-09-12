@@ -70,12 +70,18 @@ jobs:
       # We only want generated headers, but configure will not get that far
       # without it. Same llvm-mingw the Linux PE job uses, macOS build.
       - name: Install llvm-mingw (macOS)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)
-          echo "llvm-mingw $TAG"
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
+          # Resolve the asset with authenticated gh, not bare curl to the API:
+          # the unauthenticated call gets rate-limited with a 403, which left
+          # TAG empty and produced a garbage download URL that also 403'd.
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-macos-universal.tar.xz")) | .browser_download_url')
+          if [ -z "$URL" ]; then echo "::error::could not resolve llvm-mingw macOS asset"; exit 1; fi
+          echo "asset: $URL"
           curl -fsSL "$URL" -o /tmp/llvm-mingw.tar.xz
+          ls -lh /tmp/llvm-mingw.tar.xz
           sudo mkdir -p /opt
           sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
           DIR=$(ls -d /opt/llvm-mingw-* | head -1)

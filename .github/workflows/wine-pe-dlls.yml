@@ -63,11 +63,15 @@ jobs:
       # llvm-mingw is what provides aarch64 AND arm64ec Windows targets; the
       # distro mingw packages do not do arm64ec at all.
       - name: Install llvm-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)
-          echo "latest llvm-mingw tag: $TAG"
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          # Authenticated: the bare API call is rate-limited to a 403, which
+          # leaves the tag empty and builds a garbage download URL.
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
+          if [ -z "$URL" ]; then echo "::error::could not resolve llvm-mingw asset"; exit 1; fi
+          echo "asset: $URL"
           curl -fsSL "$URL" -o /tmp/llvm-mingw.tar.xz
           sudo mkdir -p /opt
           sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
