@@ -47,7 +47,14 @@ cmake -S "$FEX" -B "$BUILD" -G "$GEN" \
   -DENABLE_LTO=OFF \n  -DTUNE_CPU=none \n  -DTUNE_ARCH=generic \
   "$@"
 
-cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
+# Build only the STATIC targets the Xcode project links. The FEXCore_shared
+# dylib cannot link on iOS and is not needed:
+#   _ios_fex_mono_bridge_armed, _ios_fex_mono_take_pending, _rpm_cas_snapshot_take
+#     -> defined in Source/Windows/ARM64EC/, which CMakeLists skips on Apple
+#   _f128_mul, _extF80_to_i64, _f64_to_extF80, ...
+#     -> External/SoftFloat-3e, not linked into the shared target
+# libFEXCore.a already built fine at step 168/169; only 169 (the dylib) failed.
+cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)" \n  --target FEXCore FEXCore_Base
 
 echo "--- produced ---"
 find "$BUILD" -name '*.a' | sed "s|$BUILD/|  |"
