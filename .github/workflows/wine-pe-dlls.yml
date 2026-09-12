@@ -1,0 +1,134 @@
+name: Build missing Wine PE DLLs
+
+# Tier 0 (+ the PE half of Tier 2).
+#
+# The DLLs in app/Madeira/{aarch64,arm64ec}-windows/ are WINDOWS PE binaries
+# cross-compiled with llvm-mingw. They have nothing to do with iOS, so they build
+# on Linux in minutes and need no Mac, no Xcode and no iOS SDK. That makes this
+# the one part of the stack that is not blocked behind FEX.
+#
+# Madeira ships 110/120 DLLs; the wine fork can build 730. This adds the ones
+# games actually miss:
+#
+#   XAudio2      UE5 and Unity's default Windows audio backend. Absent entirely
+#                -- zero of the 23 xaudio2/x3daudio/xapofx DLLs are shipped.
+#                dlls/xaudio2_9/Makefile.in imports $(FAUDIO_PE_LIBS) and
+#                libs/faudio is bundled, so this is a pure PE build: FAudio is
+#                compiled INTO the DLL. No unixlib, no external fetch.
+#   d3d8/10/ddraw  older D3D, all routed through the already-shipped wined3d.
+#   MSVC runtimes  common game prerequisites.
+#   winevulkan + vulkan-1  the PE half of the DX12 chain:
+#                d3d12.dll -> libs/vkd3d (bundled) -> vulkan-1 -> winevulkan
+#                -> an ICD. Everything except the ICD is free; the ICD is
+#                MoltenVK and is the only genuinely hard part.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Space-separated dll dirs to build (blank = the default set)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  pe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (wine submodule only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch the wine submodule
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 wine
+          cd wine && echo "wine $(cat VERSION)" && git log --oneline -1
+
+      - name: Host build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison gcc-multilib libc6-dev-i386 \
+            pkg-config gettext autoconf perl python3 curl xz-utils
+
+      # llvm-mingw is what gives us aarch64 AND arm64ec Windows targets. The
+      # distro mingw packages do not do arm64ec at all.
+      - name: Install llvm-mingw
+        run: |
+          set -euo pipefail
+          VER=20250910
+          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${VER}/llvm-mingw-${VER}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          echo "fetching $URL"
+          curl -fsSL "$URL" -o /tmp/llvm-mingw.tar.xz || {
+            echo "::error::llvm-mingw ${VER} not downloadable - check the release tag"; exit 1; }
+          sudo mkdir -p /opt && sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
+          DIR="$(ls -d /opt/llvm-mingw-* | head -1)"
+          echo "$DIR/bin" >> "$GITHUB_PATH"
+          echo "installed: $DIR"
+          "$DIR/bin/aarch64-w64-mingw32-clang" --version | head -1
+          ls "$DIR/bin" | grep -iE 'arm64ec|aarch64' | head -10
+
+      - name: Configure wine for aarch64 + arm64ec PE
+        working-directory: wine
+        run: |
+          set -euo pipefail
+          ./configure \
+            --enable-archs=aarch64,arm64ec \
+            --without-x --without-freetype --without-fontconfig \
+            --without-alsa --without-oss --without-pulse --without-coreaudio \
+            --without-gstreamer --without-opengl --without-vulkan \
+            --disable-tests \
+            2>&1 | tail -40
+          echo "--- configure summary ---"
+          grep -E 'PE arch|arm64ec|aarch64' config.log | tail -10 || true
+
+      - name: Build the DLLs
+        working-directory: wine
+        run: |
+          set -euo pipefail
+          DEFAULT="xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_7 xapofx1_5 \
+                   d3d8 d3d10 d3d10_1 ddraw \
+                   msvcp120 msvcr110 atl100 dxdiagn wbemprox xolehlp \
+                   winevulkan vulkan-1"
+          TARGETS="${{ inputs.targets }}"
+          [ -n "$TARGETS" ] || TARGETS="$DEFAULT"
+          echo "building: $TARGETS"
+          # Host tools first (winebuild, widl, tools/*) - everything depends on them.
+          make -j"$(nproc)" tools 2>&1 | tail -20
+          FAILED=""
+          for t in $TARGETS; do
+            echo "=== dlls/$t ==="
+            if make -j"$(nproc)" "dlls/$t" 2>&1 | tail -15; then :; else FAILED="$FAILED $t"; fi
+          done
+          [ -z "$FAILED" ] || echo "::warning::these did not build:$FAILED"
+
+      - name: Collect what was produced
+        run: |
+          set -euo pipefail
+          for arch in aarch64-windows arm64ec-windows; do
+            mkdir -p "out/$arch"
+            find wine/dlls -path "*/$arch/*.dll" -exec cp {} "out/$arch/" \; 2>/dev/null || true
+            echo "$arch: $(ls out/$arch 2>/dev/null | wc -l) dlls"
+            ls "out/$arch" 2>/dev/null | sed 's/^/    /' || true
+          done
+          echo
+          echo "=== XAudio2 present? (the headline) ==="
+          for a in aarch64-windows arm64ec-windows; do
+            for d in xaudio2_9.dll x3daudio1_7.dll; do
+              [ -f "out/$a/$d" ] && echo "  OK      $a/$d" || echo "  absent  $a/$d"
+            done
+          done
+          TOTAL=$(find out -name '*.dll' | wc -l)
+          echo "total: $TOTAL"
+          [ "$TOTAL" -gt 0 ] || { echo "::error::no DLLs produced at all"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wine-pe-dlls
+          path: out/
+          retention-days: 7
