@@ -130,9 +130,9 @@ jobs:
             "FEXCore/Source:libFEXCore.a" \
             "FEXCore/Source:libFEXCore_Base.a" \
             "External/fmt:libfmt.a" \
-            "External/cephes:libcephes.a" \
+            "External/cephes:libcephes_128bit.a" \
             "External/xxhash/cmake_unofficial:libxxhash.a" \
-            "External/SoftFloat-3e:libsoftfloat-3e.a" ; do
+            "External/SoftFloat-3e:libsoftfloat_3e.a" ; do
             d="${spec%%:*}"; l="${spec##*:}"
             f="build-ios/$d/$l"
             if [ -f "$f" ]; then
