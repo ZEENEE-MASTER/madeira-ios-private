@@ -1,0 +1,156 @@
+name: Build the missing Unix-side libraries
+
+# The app links four static libraries that are neither committed nor producible
+# from a clean checkout:
+#
+#   libntdll_unix.a  libwin32u_unix.a  libwineserver.a  libdxmt_combined.a
+#
+# Their build scripts need artifacts that were never committed:
+#   wine/build-macos          a CONFIGURED wine tree (used for generated headers)
+#   toolchains/gnutls-ios     build/gnutls-ios/build.sh produces it
+#   toolchains/freetype-ios   build/freetype-ios/build.sh produces it
+#   toolchains/llvm-ios-build a custom LLVM cross-built for iOS (dxmt only)
+#
+# Good news from reading the scripts: build-macos is referenced ONLY for
+# includes --
+#   -include "$WINE_BUILD/include/config.h"
+#   -I "$WINE_BUILD/include" -I "$WINE_BUILD/dlls/ntdll" -I "$WINE_BUILD/dlls/win32u"
+# -- so a configure plus enough of a build to generate headers is sufficient. A
+# full macOS Wine build is not needed.
+#
+# Staged deliberately: each step reports what it produced, so a failure says
+# which stage to work on rather than burying it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Stop after this stage (1=wine configure, 2=+toolchains, 3=+unix libs, 4=all)"
+        type: choice
+        options: ["1", "2", "3", "4"]
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  unixlibs:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch the wine submodule
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 wine
+          echo "wine $(cat wine/VERSION)"
+
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST"; fi
+          xcodebuild -version | head -1
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Host tools
+        run: |
+          set -euo pipefail
+          brew install bison flex mingw-w64 || true
+          echo "bison: $(brew --prefix bison)/bin/bison"
+
+      # ---- STAGE 1 -------------------------------------------------------
+      # A configured out-of-tree wine build. We need include/config.h and the
+      # generated headers under include/, dlls/ntdll/ and dlls/win32u/.
+      - name: "Stage 1: configure wine for macOS"
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          ../configure \
+            --enable-win64 \
+            --without-x --without-freetype --without-fontconfig \
+            --without-gstreamer --without-vulkan --without-opengl \
+            --without-alsa --without-oss --without-pulse \
+            --without-sane --without-usb --without-capi --without-gphoto \
+            --disable-tests \
+            2>&1 | tail -25
+          echo "--- config.h present? ---"
+          ls -l include/config.h
+
+      - name: "Stage 1: generate headers"
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          cd wine/build-macos
+          # Header generation only: tools first (widl/winebuild), then the
+          # include tree. A full wine build is not needed and would fail on the
+          # fork's iOS-specific unix side anyway.
+          make -j"$(sysctl -n hw.ncpu)" tools 2>&1 | tail -8 || true
+          make -j"$(sysctl -n hw.ncpu)" include 2>&1 | tail -8 || true
+          echo "--- what the unix-lib scripts need ---"
+          for p in include/config.h include/winuser.h dlls/ntdll dlls/win32u; do
+            if [ -e "$p" ]; then echo "  OK      $p"; else echo "  MISSING $p"; fi
+          done
+          echo "  generated headers in include/: $(find include -name '*.h' | wc -l | tr -d ' ')"
+
+      - name: "Stage 1: report"
+        run: |
+          set -euo pipefail
+          echo "wine/build-macos size: $(du -sh wine/build-macos | cut -f1)"
+          find wine/build-macos -maxdepth 1 -type d | sed 's/^/  /' | head -15
+
+      # ---- STAGE 2 -------------------------------------------------------
+      - name: "Stage 2: gnutls + freetype for iOS"
+        if: ${{ inputs.stage != '1' }}
+        run: |
+          set -euo pipefail
+          for s in gnutls-ios freetype-ios; do
+            echo "=== build/$s ==="
+            if [ -x "build/$s/build.sh" ] || [ -f "build/$s/build.sh" ]; then
+              bash "build/$s/build.sh" 2>&1 | tail -20 || echo "::warning::$s failed"
+            else
+              echo "  no build.sh"
+            fi
+          done
+          echo "--- toolchains/ ---"
+          ls -la toolchains 2>/dev/null | sed 's/^/  /' || echo "  (toolchains/ not created)"
+
+      - name: Report what exists so far
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "=== the four target libraries ==="
+          for l in libntdll_unix.a libwin32u_unix.a libwineserver.a libdxmt_combined.a; do
+            f=$(find . -name "$l" -not -path './.git/*' 2>/dev/null | head -1)
+            if [ -n "$f" ]; then echo "  OK      $l  ($f)"; else echo "  missing $l"; fi
+          done
+          echo "=== prerequisites ==="
+          for p in wine/build-macos/include/config.h toolchains; do
+            if [ -e "$p" ]; then echo "  OK      $p"; else echo "  missing $p"; fi
+          done
+
+      - name: Stage the wine build tree (headers only)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if [ -d wine/build-macos ]; then
+            tar -czf out/wine-build-macos-headers.tgz \
+              --exclude='*.o' --exclude='*.a' --exclude='*.so' \
+              wine/build-macos/include wine/build-macos/dlls/ntdll \
+              wine/build-macos/dlls/win32u 2>/dev/null || true
+            ls -lh out/ | sed 's/^/  /'
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unix-libs-stage
+          path: out/
+          retention-days: 7
