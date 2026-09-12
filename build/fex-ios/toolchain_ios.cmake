@@ -34,3 +34,15 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM BEFORE)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# FEX defaults to TUNE_CPU=native, which runs
+#   Scripts/aarch64_fit_native.py /proc/cpuinfo
+# to pick an -mcpu= value. There is no /proc/cpuinfo on macOS, so the script
+# dies and CMakeLists.txt:510 string(STRIP) is handed an empty argument.
+#
+# "none" is FEX's own escape hatch -- CMakeLists.txt:530 reads
+#   elseif (NOT TUNE_CPU STREQUAL "none")
+# so this skips CPU tuning entirely. Correct for a cross-compile regardless:
+# the build host's CPU says nothing about the phone's.
+set(TUNE_CPU "none" CACHE STRING "" FORCE)
+set(TUNE_ARCH "generic" CACHE STRING "" FORCE)

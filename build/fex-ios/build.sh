@@ -40,7 +40,7 @@ cmake -S "$FEX" -B "$BUILD" -G "$GEN" \
   -DENABLE_JEMALLOC=OFF \
   -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
   -DENABLE_FEX_ALLOCATOR=OFF \
-  -DENABLE_LTO=OFF \
+  -DENABLE_LTO=OFF \n  -DTUNE_CPU=none \n  -DTUNE_ARCH=generic \
   "$@"
 
 cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
