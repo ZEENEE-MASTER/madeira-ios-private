@@ -178,6 +178,41 @@ jobs:
             [ -f "app/Madeira/x86_64-vcruntime/$want" ] || { echo "::error::$want missing"; exit 1; }
           done
 
+      # The Xcode project links libFEXCore.a / libFEXCore_Base.a from
+      # FEX/build-ios/ and includes FEXCore headers, none of which exist until
+      # FEX is built. Uses build/fex-ios/, which this fork added because
+      # upstream has no FEX build script and the FEX fork has no iOS toolchain
+      # file -- even though its CMakeLists supports Darwin/iOS.
+      - name: Build FEXCore for iOS
+        run: |
+          set -euo pipefail
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
+            brew install python-setuptools || true
+          fi
+          if ! python3 -c 'import pkg_resources' 2>/dev/null; then
+            python3 -m pip install --user --break-system-packages setuptools || true
+          fi
+          git submodule update --init --depth 1 --recursive FEX 2>&1 | tail -5 || true
+          bash build/fex-ios/build.sh 2>&1 | tail -30
+
+      - name: Verify FEX produced what the app links
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for f in             FEX/build-ios/include/FEXCore/Config/ConfigValues.inl             FEX/build-ios/FEXCore/Source/libFEXCore.a             FEX/build-ios/FEXCore/Source/libFEXCore_Base.a ; do
+            if [ -e "$f" ]; then
+              echo "  OK      $f"
+            else
+              echo "  MISSING $f"; MISSING=1
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            echo "--- everything FEX did produce ---"
+            find FEX/build-ios -name '*.a' -o -name '*.inl' 2>/dev/null | head -20
+            echo "::warning::FEX output incomplete; the link step will likely fail"
+          fi
+
       - name: Build (unsigned)
         run: |
           set -euo pipefail
