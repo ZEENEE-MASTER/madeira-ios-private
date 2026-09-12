@@ -29,6 +29,10 @@ python3 -c 'import packaging' 2>/dev/null || {
   exit 1
 }
 
+# The fork's committed tree has unguarded Windows API calls in files that do not
+# include windows.h. Idempotent, diagnostics only.
+python3 "$HERE/patch-ios-build.py"
+
 GEN=Ninja
 command -v ninja >/dev/null 2>&1 || GEN="Unix Makefiles"
 

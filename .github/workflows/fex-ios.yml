@@ -93,6 +93,7 @@ jobs:
           # string(STRIP) is handed an empty argument.
           python3 -c 'import packaging' 2>/dev/null             || brew install python-packaging             || python3 -m pip install --user --break-system-packages packaging
           python3 -c 'import packaging.version; print("packaging", packaging.version.__name__, "OK")'
+          python3 build/fex-ios/patch-ios-build.py
           cmake -S FEX -B FEX/build-ios -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/fex-ios/toolchain_ios.cmake"             -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}"             -DCMAKE_BUILD_TYPE=Release             -DBUILD_TESTING=OFF             -DBUILD_FEX_LINUX_TESTS=OFF             -DENABLE_JEMALLOC=OFF             -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF             -DENABLE_FEX_ALLOCATOR=OFF             -DENABLE_LTO=OFF -DTUNE_CPU=none -DTUNE_ARCH=generic             2>&1 | tail -40
 
       # ConfigValues.inl / ConfigOptions.inl come from an add_custom_command, so
