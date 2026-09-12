@@ -51,7 +51,7 @@ cmake -S "$FEX" -B "$BUILD" -G "$GEN" -DCMAKE_TOOLCHAIN_FILE="$HERE/toolchain_io
 #     -> External/SoftFloat-3e, not linked into that target
 # libFEXCore.a builds fine at step 168/169; only 169 (the dylib) ever failed.
 NPROC="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
-cmake --build "$BUILD" --parallel "$NPROC" --target FEXCore FEXCore_Base
+cmake --build "$BUILD" --parallel "$NPROC" --target FEXCore FEXCore_Base JemallocLibs
 
 echo "--- produced ---"
 find "$BUILD" -name '*.a' | sed "s|$BUILD/|  |"

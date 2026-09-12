@@ -118,7 +118,7 @@ jobs:
         working-directory: FEX
         run: |
           set -euo pipefail
-          cmake --build build-ios --parallel "$(sysctl -n hw.ncpu)" --target FEXCore FEXCore_Base 2>&1 | tail -50
+          cmake --build build-ios --parallel "$(sysctl -n hw.ncpu)" --target FEXCore FEXCore_Base JemallocLibs 2>&1 | tail -50
 
       - name: Report the libraries the Xcode project needs
         working-directory: FEX
