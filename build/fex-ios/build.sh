@@ -54,7 +54,7 @@ cmake -S "$FEX" -B "$BUILD" -G "$GEN" \
 #   _f128_mul, _extF80_to_i64, _f64_to_extF80, ...
 #     -> External/SoftFloat-3e, not linked into the shared target
 # libFEXCore.a already built fine at step 168/169; only 169 (the dylib) failed.
-cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)" \n  --target FEXCore FEXCore_Base
+cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu 2>/dev/null || nproc)" --target FEXCore FEXCore_Base
 
 echo "--- produced ---"
 find "$BUILD" -name '*.a' | sed "s|$BUILD/|  |"
