@@ -293,3 +293,77 @@ while the project links `libdxmt_combined.a` — a different file.
 
 Steps 1–4 are a substantial but tractable chain. Step 5 is the one that may need
 the author.
+
+---
+
+# The four missing libraries — three built
+
+Run `.github/workflows/unix-libs.yml` (stage 3). Everything below came from a
+clean checkout; none of it was committed upstream.
+
+| library | result |
+|---|---|
+| `libntdll_unix.a` | **built** — 30/30 modules |
+| `libwin32u_unix.a` | **built** — 46/46 modules, freetype merged, 3.46 MB |
+| `libwineserver.a` | **built** — 44/44 sources, 45 objects |
+| `libdxmt_combined.a` | needs LLVM 15 for iOS (`llvm-ios.yml`) |
+
+## Step 1 — wine/build-macos
+
+Configure only; the unix scripts use it for headers, never for objects. Two
+things were needed beyond a plain configure:
+
+* **llvm-mingw on the macOS host.** Wine's configure refuses on an arm64 host
+  without a PE cross-compiler, even when only headers are wanted:
+  `configure: error: PE cross-compilation is required for aarch64`.
+* **The IDL-derived headers, explicitly.** `make include` produces only
+  `config.h`. win32u then fails 24 of 46 modules with
+  `combaseapi.h:29: fatal error: 'objidlbase.h' file not found`. Walking
+  `wine/include/*.idl` and making each `.h` generated **345 headers** and took
+  win32u to 46/46. ntdll was unaffected because it never includes
+  `combaseapi.h` — which is exactly why the failure split the way it did.
+
+## Step 2 — toolchains/
+
+`build/gnutls-ios/build.sh` works as-is (gmp → nettle → gnutls, all arm64).
+`build/freetype-ios/build.sh` exits with `ERROR: clone freetype first`; its own
+header names the command:
+
+```
+git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+```
+
+## Step 5 — the wineserver base, solved
+
+`build/wineserver/build.sh` compiles 19 files and *replaces* those objects in an
+existing archive, exiting with `ERROR: No base libwineserver.a found` when there
+is none. The base holds the other ~25 of `wine/server`'s 44 sources and is not
+committed — this was the single strongest reason the app could not be linked.
+
+It did not need the author. Every flag is in `build.sh`, so
+`build/wineserver/make-base.sh` compiles **all 44** upstream sources with
+byte-identical flags and archives them; `build.sh` then overwrites its 19 as
+designed. All 44 compiled on the first attempt, zero failures.
+
+The flags are duplicated between the two scripts by necessity — if `build.sh`'s
+`CC_FLAGS` ever change, `make-base.sh` must follow, or the base and the
+replacements will disagree about struct layouts and the `-Dmain=wineserver_main`
+rename.
+
+## A trap worth remembering
+
+A diagnostic step killed a **successful** build:
+
+```
+Results: 46 succeeded, 0 failed
+libwin32u_unix.a: 3458608 bytes
+Done!
+=== first errors from failed win32u modules ===
+--- class.err ---
+##[error]Process completed with exit code 1
+```
+
+`class.err` existed but was empty, `grep 'error:'` matched nothing, exited 1, and
+`set -euo pipefail` took the step down — which also prevented the wineserver
+stage from running. Under `pipefail`, any grep that is *allowed* to find nothing
+needs `|| true`.
