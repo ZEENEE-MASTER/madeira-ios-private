@@ -93,48 +93,53 @@ jobs:
       # `make dlls/<name>` returned 0 for all 17 modules and produced nothing,
       # so it is a no-op target rather than a build. Find out what the generated
       # Makefile actually calls these.
-      # Per-target builds hit "No rule to make target" for every arm64ec .dll:
-      # Wine generates arm64ec .o rules but the .dll rules only appeared for
-      # aarch64. Rather than keep guessing target names, build the whole PE tree
-      # and observe what Wine actually emits for each arch.
-      - name: Build all PE DLLs
+      # Back to per-target. A plain `make` builds the UNIX side too, and this
+      # fork's Unix side does not link outside Madeira's own build chain:
+      #   ld: dlls/win32u/dibdrv/bitblt.o: undefined reference to `ios_srcwatch_arm`
+      # That symbol lives in Madeira's build/win32u-unix/, not in the wine tree.
+      # We only want PE DLLs, and naming the PE target explicitly builds only
+      # those. Run 2 proved this works: 17/17.
+      #
+      # aarch64-windows only, deliberately. With both arches enabled Wine emits
+      # ARM64X hybrids (tools/makedep.c pairs arm64ec into aarch64), verified by
+      # parsing the artifacts' PE load config: 0x140, the CHPE-extended layout.
+      # One file serves both ARM64 and ARM64EC processes, so the same binaries
+      # go into arm64ec-windows/ too.
+      - name: Build the PE DLLs
         working-directory: wine
         run: |
           set -euo pipefail
-          echo "cores: $(nproc)"
-          make -j"$(nproc)" 2>&1 | tail -25
-          echo "=== what exists per arch ==="
-          for arch in aarch64-windows arm64ec-windows; do
-            n=$(find dlls -path "*/$arch/*.dll" 2>/dev/null | wc -l)
-            echo "  $arch: $n dlls"
-          done
+          DEFAULT="xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7 xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5 xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinput9_1_0 d3d8 d3d10 d3d10_1 ddraw dinput msvcp100 msvcp110 msvcp120 msvcr100 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
+          TARGETS="${{ inputs.targets }}"
+          if [ -z "$TARGETS" ]; then TARGETS="$DEFAULT"; fi
+          make -j"$(nproc)" tools 2>&1 | tail -5
 
-      - name: Report the targets we care about
-        working-directory: wine
-        run: |
-          set -euo pipefail
-          WANT="xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_7 xapofx1_5 d3d8 d3d10 d3d10_1 ddraw msvcp120 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
-          for arch in aarch64-windows arm64ec-windows; do
-            echo "--- $arch ---"
-            for t in $WANT; do
-              f="dlls/$t/$arch/$t.dll"
-              if [ -f "$f" ]; then
-                echo "  OK      $t.dll  $(stat -c%s "$f") bytes"
-              else
-                echo "  absent  $t.dll"
-              fi
-            done
+          BUILT=0; FAILED=""
+          for t in $TARGETS; do
+            if make -j"$(nproc)" "dlls/$t/aarch64-windows/$t.dll" > /tmp/m.log 2>&1; then
+              echo "  OK      $t.dll"
+              BUILT=$((BUILT + 1))
+            else
+              echo "  FAILED  $t"
+              tail -4 /tmp/m.log | sed 's/^/            /'
+              FAILED="$FAILED $t"
+            fi
           done
+          echo "BUILT: $BUILT"
+          if [ -n "$FAILED" ]; then echo "::warning::did not build:$FAILED"; fi
+          if [ "$BUILT" -eq 0 ]; then echo "::error::nothing built"; exit 1; fi
 
       - name: Collect what was produced
         run: |
           set -euo pipefail
+          mkdir -p out/aarch64-windows out/arm64ec-windows
+          find wine/dlls -path "*/aarch64-windows/*.dll" -exec cp {} out/aarch64-windows/ ';' 2>/dev/null || true
+          # Same ARM64X hybrids serve both process types.
+          cp out/aarch64-windows/*.dll out/arm64ec-windows/ 2>/dev/null || true
           for arch in aarch64-windows arm64ec-windows; do
-            mkdir -p "out/$arch"
-            find wine/dlls -path "*/$arch/*.dll" -exec cp {} "out/$arch/" ';' 2>/dev/null || true
             echo "$arch: $(ls "out/$arch" | wc -l) dlls"
-            ls "out/$arch" | sed 's/^/    /' || true
           done
+          ls out/aarch64-windows | sed 's/^/    /' || true
           echo "=== headline check ==="
           for a in aarch64-windows arm64ec-windows; do
             for d in xaudio2_9.dll x3daudio1_7.dll winevulkan.dll; do
