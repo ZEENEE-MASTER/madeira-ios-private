@@ -172,6 +172,15 @@ jobs:
             done
           fi
 
+      - name: "Stage 3: wineserver (base + patches)"
+        if: ${{ inputs.stage == '3' || inputs.stage == '4' }}
+        run: |
+          set -euo pipefail
+          echo "=== creating the base archive build.sh cannot ==="
+          bash build/wineserver/make-base.sh 2>&1 | tail -30 || echo "::warning::base failed"
+          echo "=== build/wineserver (applies its 19 replacements) ==="
+          bash build/wineserver/build.sh 2>&1 | tail -25 || echo "::warning::wineserver failed"
+
       - name: Report what exists so far
         if: always()
         run: |
