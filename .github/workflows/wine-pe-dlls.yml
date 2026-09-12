@@ -93,48 +93,38 @@ jobs:
       # `make dlls/<name>` returned 0 for all 17 modules and produced nothing,
       # so it is a no-op target rather than a build. Find out what the generated
       # Makefile actually calls these.
-      - name: Discover the real make targets
+      # Per-target builds hit "No rule to make target" for every arm64ec .dll:
+      # Wine generates arm64ec .o rules but the .dll rules only appeared for
+      # aarch64. Rather than keep guessing target names, build the whole PE tree
+      # and observe what Wine actually emits for each arch.
+      - name: Build all PE DLLs
         working-directory: wine
         run: |
           set -euo pipefail
-          echo "--- targets mentioning xaudio2_9 ---"
-          grep -oE "^[^ :]*xaudio2_9[^ :]*:" Makefile | sort -u | head -20 || echo "  none"
-          echo "--- targets mentioning d3d8 ---"
-          grep -oE "^[^ :]*d3d8[^ :]*:" Makefile | sort -u | head -10 || echo "  none"
-          echo "--- any *-windows paths in the Makefile ---"
-          grep -oE "[a-z0-9_]+-windows/[a-z0-9_.-]+\.dll" Makefile | sort -u | head -10 || echo "  none"
-
-      - name: Build the DLLs
-        working-directory: wine
-        run: |
-          set -euo pipefail
-          DEFAULT="xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_7 xapofx1_5 d3d8 d3d10 d3d10_1 ddraw msvcp120 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
-          TARGETS="${{ inputs.targets }}"
-          if [ -z "$TARGETS" ]; then TARGETS="$DEFAULT"; fi
-          echo "building: $TARGETS"
-          make -j"$(nproc)" tools 2>&1 | tail -5
-
-          BUILT=0
-          for t in $TARGETS; do
-            echo "=== $t ==="
-            for arch in aarch64-windows arm64ec-windows; do
-              make -j"$(nproc)" "dlls/$t/$arch/$t.dll" 2>&1 | tail -4 || true
-            done
-            n=$(find "dlls/$t" -name "*.dll" 2>/dev/null | wc -l)
-            echo "  produced $n dll(s)"
-            find "dlls/$t" -name "*.dll" 2>/dev/null | head -4 | sed 's/^/    /'
-            BUILT=$((BUILT + n))
+          echo "cores: $(nproc)"
+          make -j"$(nproc)" 2>&1 | tail -25
+          echo "=== what exists per arch ==="
+          for arch in aarch64-windows arm64ec-windows; do
+            n=$(find dlls -path "*/$arch/*.dll" 2>/dev/null | wc -l)
+            echo "  $arch: $n dlls"
           done
-          echo "TOTAL BUILT: $BUILT"
 
-          if [ "$BUILT" -eq 0 ]; then
-            echo "--- dlls/xaudio2_9 contents ---"
-            ls -la dlls/xaudio2_9 | head -20
-            echo "--- any .dll anywhere ---"
-            find . -name "*.dll" | head -20
-            echo "--- first 40 Makefile targets ---"
-            grep -oE "^[^ 	:][^ :]*:" Makefile | head -40
-          fi
+      - name: Report the targets we care about
+        working-directory: wine
+        run: |
+          set -euo pipefail
+          WANT="xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_7 xapofx1_5 d3d8 d3d10 d3d10_1 ddraw msvcp120 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
+          for arch in aarch64-windows arm64ec-windows; do
+            echo "--- $arch ---"
+            for t in $WANT; do
+              f="dlls/$t/$arch/$t.dll"
+              if [ -f "$f" ]; then
+                echo "  OK      $t.dll  $(stat -c%s "$f") bytes"
+              else
+                echo "  absent  $t.dll"
+              fi
+            done
+          done
 
       - name: Collect what was produced
         run: |
