@@ -95,9 +95,10 @@ jobs:
           python3 -c 'import packaging.version; print("packaging", packaging.version.__name__, "OK")'
           cmake -S FEX -B FEX/build-ios -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$PWD/build/fex-ios/toolchain_ios.cmake"             -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}"             -DCMAKE_BUILD_TYPE=Release             -DBUILD_TESTING=OFF             -DBUILD_FEX_LINUX_TESTS=OFF             -DENABLE_JEMALLOC=OFF             -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF             -DENABLE_FEX_ALLOCATOR=OFF             -DENABLE_LTO=OFF -DTUNE_CPU=none -DTUNE_ARCH=generic             2>&1 | tail -40
 
-      # Whether or not the libraries build, a successful configure has already
-      # produced the two generated headers that blocked the app build at
-      # 'FEXCore/Config/ConfigValues.inl file not found'.
+      # ConfigValues.inl / ConfigOptions.inl come from an add_custom_command, so
+      # they appear during BUILD, not during configure. This check runs before
+      # the build and reporting them absent here is expected -- it is here to
+      # show where they land once they do.
       - name: Check the generated headers
         working-directory: FEX
         run: |

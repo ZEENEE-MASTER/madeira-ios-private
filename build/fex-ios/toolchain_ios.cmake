@@ -46,3 +46,20 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 # the build host's CPU says nothing about the phone's.
 set(TUNE_CPU "none" CACHE STRING "" FORCE)
 set(TUNE_ARCH "generic" CACHE STRING "" FORCE)
+
+# FEX_IOS_HOST gates every iOS-specific block the author added -- 14 uses in
+# FEXCore/Source/Interface/Core/Core.cpp alone, e.g.
+#
+#   #ifdef FEX_IOS_HOST
+#   extern "C" uint64_t IosCbEntryLog[8];
+#   extern "C" uint64_t IosFfsBypassLog[4];
+#   #endif
+#
+# The DECLARATIONS are guarded; some of the USES are not. So without this macro
+# the build fails with "use of undeclared identifier 'IosFfsBypassLog'" rather
+# than quietly compiling those blocks out.
+#
+# It is defined in no CMakeLists in the tree -- the author passes it from his own
+# invocation. _INIT is the toolchain-file mechanism for seeding flags.
+set(CMAKE_C_FLAGS_INIT "-DFEX_IOS_HOST=1")
+set(CMAKE_CXX_FLAGS_INIT "-DFEX_IOS_HOST=1")
