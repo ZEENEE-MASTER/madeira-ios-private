@@ -77,6 +77,25 @@ patch(
 )
 
 
+# ---------------------------------------------------------------------------
+# LinkerGC.cmake: GNU ld flags applied unconditionally in Release.
+#
+#   ld: unknown options: --gc-sections --strip-all --as-needed
+#
+# Apple's linker takes none of the three. They are size/link-time optimisations
+# only, so dropping them on Apple costs nothing but a slightly larger binary.
+# ---------------------------------------------------------------------------
+patch(
+    "Data/CMake/LinkerGC.cmake",
+    """macro(LinkerGC target)
+  if (CMAKE_BUILD_TYPE MATCHES "RELEASE")""",
+    """macro(LinkerGC target)
+  # Apple's ld accepts none of --gc-sections / --strip-all / --as-needed.
+  if (CMAKE_BUILD_TYPE MATCHES "RELEASE" AND NOT APPLE)""",
+    "skip GNU-only linker flags on Apple",
+)
+
+
 for line in applied:
     print(f"  applied  {line}")
 for line in skipped:
