@@ -60,8 +60,28 @@ jobs:
       - name: Host tools
         run: |
           set -euo pipefail
-          brew install bison flex mingw-w64 || true
+          brew install bison flex || true
           echo "bison: $(brew --prefix bison)/bin/bison"
+
+      # Wine's configure refuses to proceed on an arm64 host without a PE
+      # cross-compiler:
+      #   configure: error: PE cross-compilation is required for aarch64,
+      #   please install clang/llvm-dlltool/lld, or llvm-mingw.
+      # We only want generated headers, but configure will not get that far
+      # without it. Same llvm-mingw the Linux PE job uses, macOS build.
+      - name: Install llvm-mingw (macOS)
+        run: |
+          set -euo pipefail
+          TAG=$(curl -fsSL https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -oE '"tag_name": *"[^"]+"' | head -1 | cut -d'"' -f4)
+          echo "llvm-mingw $TAG"
+          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${TAG}/llvm-mingw-${TAG}-ucrt-macos-universal.tar.xz"
+          curl -fsSL "$URL" -o /tmp/llvm-mingw.tar.xz
+          sudo mkdir -p /opt
+          sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
+          DIR=$(ls -d /opt/llvm-mingw-* | head -1)
+          echo "$DIR/bin" >> "$GITHUB_PATH"
+          echo "installed $DIR"
+          "$DIR/bin/aarch64-w64-mingw32-clang" --version | head -1
 
       # ---- STAGE 1 -------------------------------------------------------
       # A configured out-of-tree wine build. We need include/config.h and the
