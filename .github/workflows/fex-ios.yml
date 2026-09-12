@@ -1,0 +1,162 @@
+name: Build FEX for iOS
+
+# THE GATE. app/Madeira.xcodeproj links libFEXCore.a and libFEXCore_Base.a out
+# of FEX/build-ios/, and nothing in any repo builds them:
+#
+#   * no build/fex-ios/build.sh in Madeira
+#   * no iOS toolchain file in the FEX fork -- Data/CMake/ has toolchain_aarch64,
+#     toolchain_mingw, toolchain_x86_32, toolchain_x86_64 and nothing for iOS
+#
+# But the fork's own CMakeLists DOES support iOS:
+#
+#   "FEX only supports Linux, Windows, and Darwin/iOS."
+#   CMAKE_SYSTEM_NAME STREQUAL "iOS"
+#
+#   if (NOT APPLE)
+#     # binfmt_misc, Source/, AppConfig
+#   endif()
+#
+# On Apple it skips Source/ and builds FEXCore/ only -- which is exactly the two
+# static libraries the Xcode project wants. So the support exists; only the
+# invocation is missing. This is that invocation.
+#
+# CMake has first-class iOS support via CMAKE_SYSTEM_NAME=iOS, so no custom
+# toolchain file should be needed. Deployment target is 17.0 to match what the
+# Xcode project compiles app sources with (-target arm64-apple-ios17.0, seen in
+# the Madeira build log).
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "iOS deployment target"
+        default: "17.0"
+
+permissions:
+  contents: read
+
+jobs:
+  fex:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout with the FEX submodule
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch FEX and its externals
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 FEX
+          cd FEX
+          echo "FEX $(git log --oneline -1)"
+          # FEXCore needs fmt, cephes, xxhash, SoftFloat-3e from External/
+          git submodule update --init --depth 1 --recursive External 2>&1 | tail -10 || true
+          echo "--- External/ ---"
+          ls External | sed 's/^/  /'
+          for d in fmt cephes xxhash SoftFloat-3e; do
+            if [ -n "$(ls -A "External/$d" 2>/dev/null)" ]; then
+              echo "  populated  External/$d"
+            else
+              echo "  EMPTY      External/$d"
+            fi
+          done
+
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST"; fi
+          xcodebuild -version | head -1
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          cmake --version | head -1
+
+      # build-ios is not a free choice: the Xcode project hardcodes
+      # $(SRCROOT)/../FEX/build-ios in HEADER_SEARCH_PATHS and
+      # LIBRARY_SEARCH_PATHS.
+      - name: Configure FEXCore for iOS
+        working-directory: FEX
+        run: |
+          set -euo pipefail
+          cmake -B build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_JEMALLOC=OFF \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF \
+            -DENABLE_LTO=OFF \
+            2>&1 | tail -40
+
+      # Whether or not the libraries build, a successful configure has already
+      # produced the two generated headers that blocked the app build at
+      # 'FEXCore/Config/ConfigValues.inl file not found'.
+      - name: Check the generated headers
+        working-directory: FEX
+        run: |
+          set -euo pipefail
+          for h in ConfigValues.inl ConfigOptions.inl; do
+            f="build-ios/include/FEXCore/Config/$h"
+            if [ -f "$f" ]; then
+              echo "  OK      $h  ($(wc -l < "$f") lines)"
+            else
+              echo "  absent  $h"
+              find build-ios -name "$h" 2>/dev/null | head -3 | sed 's/^/      found at: /'
+            fi
+          done
+
+      - name: Build FEXCore
+        working-directory: FEX
+        run: |
+          set -euo pipefail
+          cmake --build build-ios --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tail -50
+
+      - name: Report the libraries the Xcode project needs
+        working-directory: FEX
+        run: |
+          set -euo pipefail
+          echo "=== what the app links against ==="
+          MISSING=0
+          for spec in \
+            "FEXCore/Source:libFEXCore.a" \
+            "FEXCore/Source:libFEXCore_Base.a" \
+            "External/fmt:libfmt.a" \
+            "External/cephes:libcephes.a" \
+            "External/xxhash/cmake_unofficial:libxxhash.a" \
+            "External/SoftFloat-3e:libsoftfloat-3e.a" ; do
+            d="${spec%%:*}"; l="${spec##*:}"
+            f="build-ios/$d/$l"
+            if [ -f "$f" ]; then
+              echo "  OK      $d/$l  $(du -h "$f" | cut -f1)"
+              lipo -info "$f" 2>/dev/null | sed 's/^/            /' || true
+            else
+              echo "  MISSING $d/$l"; MISSING=1
+            fi
+          done
+          echo
+          echo "=== every .a actually produced ==="
+          find build-ios -name "*.a" | sed 's/^/  /' | head -30
+          if [ "$MISSING" -eq 1 ]; then
+            echo "::warning::some expected libraries are missing - see the list above"
+          fi
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cd FEX
+          find build-ios -name "*.a" -exec cp {} ../out/ ';' 2>/dev/null || true
+          mkdir -p ../out/include
+          cp -R build-ios/include/. ../out/include/ 2>/dev/null || true
+          ls -lh ../out | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex-ios-libs
+          path: out/
+          retention-days: 7
