@@ -210,27 +210,92 @@ satisfy `mmdevapi`'s unixlib load.
 So XAudio2 lands on a **working** chain: FAudio → mmdevapi → RemoteIO. Adding
 those DLLs should produce real sound, not just unblock startup.
 
-# Tier 2: PE half done, ICD is the wall
+# Tier 2: D3D12 — built in CI, not yet tested on a device
 
 ```
-d3d12.dll  ->  libs/vkd3d  ->  vulkan-1  ->  winevulkan  ->  ICD
- shipped       bundled         BUILT         BUILT           MoltenVK
+game (x86-64, FEX)
+  -> d3d12.dll / d3d12core.dll      vkd3d-proton v3.0.1, ARM64X    vkd3d-proton-pe.yml
+       + dxgi_bridge.c              swapchains DXMT's dxgi refuses  build/vkd3d-proton-pe/
+  -> vulkan-1.dll -> winevulkan.dll Wine PE, ARM64X                 pe-dlls job
+  -> winevulkan unixlib             static, in libntdll_unix.a      build/ntdll-unix/build.sh
+  -> win32u vulkan.c                dlopen -> static MoltenVK       build/win32u-unix/vulkan_ios.c
+  -> pVulkanInit surface driver     VK_EXT_metal_surface            build/win32u-unix/vulkan_ios_drv.c
+  -> MoltenVK v1.4.2 (static)       -force_load at link             build-full-ipa.yml
+  -> Metal, on the CAMetalLayer IOSDisplayShim already gives DXMT
 ```
 
-`.github/workflows/moltenvk-ios.yml` builds MoltenVK for iOS standalone — it
-does not need the app to link, so it is the one part of Tier 2 provable without
-FEX. It also reports, from the built library rather than from documentation,
-whether `VK_EXT_mesh_shader` and `VK_KHR_ray_tracing_pipeline` are advertised.
+`build-full-ipa.yml` has a `dx12` input (default on). With it off, none of the
+above is compiled and the IPA is the D3D11-only build.
 
-**Not done, and not doable until the app links:** wiring MoltenVK into
-winevulkan. On Unix, winevulkan's unixlib reaches an ICD through the Vulkan
-loader. iOS has no loader and no dlopen of a system Vulkan, so MoltenVK must be
-linked statically and handed to winevulkan directly. That needs the FEX gate
-cleared first.
+## Things that were not obvious
+
+**win32u only looks up two symbols by name.** `vulkan_init_once` does
+`dlopen(SONAME_LIBVULKAN)` and then `dlsym` for `vkGetInstanceProcAddr` and
+`vkGetDeviceProcAddr`; everything else goes through those. So a statically
+linked MoltenVK needs a two-entry symbol table, the same trick `freetype_ios.c`
+already uses. The references are bound by assembly name (`__asm__`) because
+Wine's `wine/vulkan.h` is built with `VK_NO_PROTOTYPES`.
+
+**win32u is active.** `load_builtin_unixlib` says it is "linked but dormant"
+unless `MADEIRA_WIN32U` is set — and `WineProcessBridge.m` sets it. Without that
+the Vulkan driver slot would never be reached.
+
+**The surface is the layer DXMT already uses.** `IOSDisplayShim.m` maps any
+HWND to a retained `CAMetalLayer` (game mode: the fullscreen one; desktop mode:
+the window's compositor layer). The Vulkan driver calls the same
+`macdrv_view_create_metal_view` and hands the layer to
+`vkCreateMetalSurfaceEXT`.
+
+**DXMT's dxgi refuses D3D12.** `src/dxgi/dxgi_factory.cpp` returns
+`DXGI_ERROR_UNSUPPORTED` for any device that is not `IMTLDXGIDevice`.
+vkd3d-proton implements no DXGI; it exposes `IDXGIVkSwapChainFactory` on its
+command queue and relies on dxgi.dll (DXVK's, under Proton) to call it.
+Replacing dxgi.dll would break DXMT's D3D11. `dxgi_bridge.c`, compiled into
+`d3d12core.dll`, wraps the factory vtable's `CreateSwapChain` and
+`CreateSwapChainForHwnd` once a D3D12 device exists. The original runs first;
+only a refused `IDXGIVkSwapChainFactory` device gets the bridge's
+`IDXGISwapChain4`, which forwards to vkd3d-proton's `IDXGIVkSwapChain` the way
+DXVK's `DxgiSwapChain` does. `VKD3D_DXGI_BRIDGE=0` turns it off.
+
+**Adapter matching falls back safely.** vkd3d-proton matches the DXGI adapter
+to a Vulkan device by LUID, then PCI IDs, then takes the first device. DXMT's
+adapter will not match; an iPhone has one GPU, so the fallback is correct.
+
+**Loader.** `loader_ios.c` does not reject non-builtin PE files (DXMT's DLLs
+carry no builtin marker either), and `virtual_ios.c` applies ARM64X
+relocations, so vkd3d-proton's ARM64X hybrids load in ARM64EC processes like
+the Wine extras do. d3d12core.dll imports 14 `D3DKMT*` functions from gdi32;
+all 14 are in this Wine's `gdi32.spec`.
+
+**d3d12.dll is the one file replaced, not added.** Upstream's is Wine's vkd3d
+build, which needs Wine's own dxgi for swapchains and so could never present.
+
+**vkd3d-proton v3.0.1 vs llvm-mingw with LLVM 23.** Its shader compilers
+relied on transitive libc++ includes (`std::launder` without `<new>`,
+`std::terminate` without `<exception>`). The workflow force-includes the
+standard headers for C++. An older llvm-mingw (20260519) is not a way round it:
+it fails meson's `-marm64x` compiler check.
+
+## The ceiling (unchanged, measured from MoltenVK's extension table)
+
+vkd3d-proton's hard requirements (`samplerMirrorClampToEdge`, robustness2 with
+null descriptors, `shaderDrawParameters`, push descriptors,
+maintenance5/maintenance6) are all present in MoltenVK. Absent:
+`VK_EXT_mesh_shader`, `VK_KHR_ray_tracing_pipeline`. That caps D3D12 at feature
+level 12_0/12_1 without DXR — no Nanite, no Lumen hardware RT, no mesh-shader
+titles. The process memory ceiling on the target device is 6656 MB, below what
+current UE5 releases allocate. D3D12 titles that fit both limits are the
+realistic target.
 
 ---
 
-# Can an IPA be built from this repository? No.
+# Can an IPA be built from this repository? (historical — now yes)
+
+**Superseded:** `build-full-ipa.yml` builds every library below from a clean
+checkout and packages an unsigned IPA. What follows is kept because it records
+why each piece was missing.
+
+## Original finding: no
 
 Not because of a build flag. The app links four static libraries that are **not
 committed and cannot be regenerated from what is here**.

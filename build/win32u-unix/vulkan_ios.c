@@ -23,6 +23,8 @@
  * and window surfaces come from vulkan_ios_drv.c.
  */
 
+#include <string.h>
+
 #ifdef MADEIRA_MOLTENVK
 #define SONAME_LIBVULKAN "libMoltenVK.a"
 #endif
