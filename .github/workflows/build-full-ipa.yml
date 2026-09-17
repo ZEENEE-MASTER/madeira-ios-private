@@ -13,6 +13,12 @@ name: Build full IPA from source
 #   44 Wine PE DLLs        wine-pe-dlls.yml   XAudio2 family etc, ARM64X hybrids
 #   x86_64 VC++ runtime    windows runner     WiX bundle defeats 7-Zip
 #
+# D3D12 (input dx12, default on):
+#   MoltenVK for iOS       here               static, cached; -force_load at link
+#   winevulkan unixlib     ntdll-unix         built when libMoltenVK.a is present
+#   win32u Vulkan + driver win32u-unix        vulkan_ios.c / vulkan_ios_drv.c
+#   d3d12.dll/d3d12core    vkd3d-proton-pe    ARM64X, with the DXGI swapchain bridge
+#
 # Every expensive stage is cached the moment it finishes (cache/save straight
 # after the build step, not at job end), keyed on the submodule commit plus the
 # hash of the scripts that build it. Run 35181977353 spent ~2.5 h reaching the
@@ -23,9 +29,17 @@ name: Build full IPA from source
 
 on:
   workflow_dispatch:
+    inputs:
+      dx12:
+        description: "Include D3D12 (vkd3d-proton + winevulkan + MoltenVK)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+env:
+  MOLTENVK_TAG: v1.4.2
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -133,8 +147,18 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
+  vkd3d:
+    if: ${{ inputs.dx12 }}
+    uses: ./.github/workflows/vkd3d-proton-pe.yml
+    with:
+      ref: v3.0.1
+      llvm_mingw: latest
+
+  # ---------------------------------------------------------------------------
   ipa:
-    needs: [vcruntime, pe-dlls]
+    needs: [vcruntime, pe-dlls, vkd3d]
+    # vkd3d is skipped when dx12 is off; that must not skip this job.
+    if: ${{ !cancelled() && needs.vcruntime.result == 'success' && needs.pe-dlls.result == 'success' && (needs.vkd3d.result == 'success' || needs.vkd3d.result == 'skipped') }}
     runs-on: macos-latest
     timeout-minutes: 330
     # Explicit `shell: bash` means -eo pipefail. The implicit default is
@@ -156,7 +180,9 @@ jobs:
           DXMT_SHA=$(git ls-tree HEAD research/dxmt | awk '{print $3}')
           {
             echo "fex=fexlibs-v1-${FEX_SHA}-${{ hashFiles('build/fex-ios/**') }}"
-            echo "unix=unixlibs-v1-${WINE_SHA}-${{ hashFiles('build/ntdll-unix/**', 'build/win32u-unix/**', 'build/crypto-unix/**', 'build/wineserver/**', 'build/gnutls-ios/**', 'build/freetype-ios/**') }}"
+            # dx12 in the key: with MoltenVK present the unix libs gain
+            # winevulkan and the Vulkan-enabled win32u, so they differ.
+            echo "unix=unixlibs-v1-dx12${{ inputs.dx12 }}-${WINE_SHA}-${{ hashFiles('build/ntdll-unix/**', 'build/win32u-unix/**', 'build/crypto-unix/**', 'build/wineserver/**', 'build/gnutls-ios/**', 'build/freetype-ios/**') }}"
             echo "dxmt=dxmtlib-v1-${DXMT_SHA}-${{ hashFiles('build/dxmt-ios/**') }}"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -237,6 +263,45 @@ jobs:
             !FEX/build-ios/**/*.o
           key: ${{ steps.keys.outputs.fex }}
 
+      # ---- MoltenVK (D3D12) ----------------------------------------------
+      # Must exist before the unix libraries build: ntdll-unix and win32u-unix
+      # switch their Vulkan parts on when app/Madeira/libMoltenVK.a is there.
+      - name: Restore MoltenVK
+        if: ${{ inputs.dx12 }}
+        id: mvk
+        uses: actions/cache/restore@v4
+        with:
+          path: app/Madeira/libMoltenVK.a
+          key: moltenvk-ios-v1-${{ env.MOLTENVK_TAG }}
+
+      - name: MoltenVK for iOS
+        if: ${{ inputs.dx12 && steps.mvk.outputs.cache-hit != 'true' }}
+        run: |
+          git clone --depth 1 --branch "$MOLTENVK_TAG" https://github.com/KhronosGroup/MoltenVK.git "$RUNNER_TEMP/MoltenVK"
+          cd "$RUNNER_TEMP/MoltenVK"
+          ./fetchDependencies --ios 2>&1 | tail -5
+          make ios 2>&1 | tail -15
+          LIB=$(find Package -name libMoltenVK.a -path '*ios-arm64/*' | head -1)
+          if [ -z "$LIB" ]; then LIB=$(find Package -name libMoltenVK.a | grep -v -i simulator | head -1); fi
+          if [ -z "$LIB" ]; then echo "::error::no libMoltenVK.a"; find Package -maxdepth 6 | head -30; exit 1; fi
+          lipo -info "$LIB"
+          cp "$LIB" "$GITHUB_WORKSPACE/app/Madeira/libMoltenVK.a"
+          ls -lh "$GITHUB_WORKSPACE/app/Madeira/libMoltenVK.a"
+
+      - name: Save MoltenVK
+        if: ${{ inputs.dx12 && steps.mvk.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: app/Madeira/libMoltenVK.a
+          key: moltenvk-ios-v1-${{ env.MOLTENVK_TAG }}
+
+      - name: MoltenVK exports what win32u binds to
+        if: ${{ inputs.dx12 }}
+        run: |
+          for sym in vkGetInstanceProcAddr vkGetDeviceProcAddr vkCreateMetalSurfaceEXT; do
+            if nm -g app/Madeira/libMoltenVK.a 2>/dev/null | grep -q " T _$sym$"; then echo "  OK      $sym"; else echo "  MISSING $sym"; exit 1; fi
+          done
+
       # ---- Wine unix side ------------------------------------------------
       - name: llvm-mingw (wine configure needs a PE cross-compiler)
         if: steps.unix.outputs.cache-hit != 'true'
@@ -274,8 +339,17 @@ jobs:
       - name: libntdll_unix.a + libwin32u_unix.a
         if: steps.unix.outputs.cache-hit != 'true'
         run: |
-          bash build/ntdll-unix/build.sh 2>&1 | tail -6
-          bash build/win32u-unix/build.sh 2>&1 | tail -6
+          bash build/ntdll-unix/build.sh > /tmp/ntdll.log 2>&1 || { tail -40 /tmp/ntdll.log; exit 1; }
+          grep -E 'winevulkan|MoltenVK|Results' /tmp/ntdll.log || true
+          tail -3 /tmp/ntdll.log
+          bash build/win32u-unix/build.sh > /tmp/win32u.log 2>&1 || { tail -40 /tmp/win32u.log; for e in build/win32u-unix/obj/*.err; do [ -s "$e" ] && { echo "== $e"; grep -m 10 error "$e" || true; }; done; exit 1; }
+          grep -E 'Vulkan|vulkan|Results' /tmp/win32u.log || true
+          tail -3 /tmp/win32u.log
+          if [ "${{ inputs.dx12 }}" = "true" ] && ! grep -q 'winevulkan_unixlib... OK' /tmp/ntdll.log; then
+            echo "::error::dx12 requested but the winevulkan unixlib did not build"
+            for e in build/ntdll-unix/obj/winevulkan_*.err; do [ -s "$e" ] && { echo "== $e"; grep -m 15 error "$e" || true; }; done
+            exit 1
+          fi
 
       - name: libwineserver.a (base + patches)
         if: steps.unix.outputs.cache-hit != 'true'
@@ -347,6 +421,12 @@ jobs:
           name: extra-pe-dlls
           path: extra-dlls
 
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.dx12 }}
+        with:
+          name: vkd3d-proton-arm64ec
+          path: vkd3d-dlls
+
       # ADD only. Upstream's DLLs carry iOS patches; never overwrite one. These
       # are ARM64X hybrids, so the same file serves both directories.
       - name: Merge extra DLLs without overwriting upstream's
@@ -361,17 +441,41 @@ jobs:
           done
           ls app/Madeira/arm64ec-windows | grep -E '^xaudio2_9|^x3daudio1_7' || echo "::warning::xaudio2 not merged"
 
+      # The one deliberate REPLACE. Upstream's d3d12.dll is Wine's vkd3d build,
+      # which needs Wine's own dxgi.dll for swapchains and can never present
+      # through DXMT's. vkd3d-proton's d3d12.dll + d3d12core.dll (with the DXGI
+      # bridge) take its place; winevulkan.dll and vulkan-1.dll come from the
+      # extra PE DLLs above.
+      - name: D3D12 DLLs (vkd3d-proton)
+        if: ${{ inputs.dx12 }}
+        run: |
+          for dir in aarch64-windows arm64ec-windows; do
+            for n in d3d12.dll d3d12core.dll; do cp "vkd3d-dlls/$n" "app/Madeira/$dir/$n"; done
+            for n in winevulkan.dll vulkan-1.dll d3d12.dll d3d12core.dll; do
+              if [ -f "app/Madeira/$dir/$n" ]; then echo "  OK      $dir/$n"; else echo "  MISSING $dir/$n"; exit 1; fi
+            done
+          done
+
       - name: Every library the app links
         run: |
           MISSING=0
-          for f in FEX/build-ios/FEXCore/Source/libFEXCore.a FEX/build-ios/FEXCore/Source/libFEXCore_Base.a FEX/build-ios/FEXCore/Source/libJemallocLibs.a FEX/build-ios/External/fmt/libfmt.a FEX/build-ios/External/cephes/libcephes_128bit.a FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a app/Madeira/libwineserver.a app/Madeira/libdxmt_combined.a app/Madeira/libgnutls.a app/Madeira/libhogweed.a app/Madeira/libnettle.a app/Madeira/libgmp.a; do
+          EXTRA=""
+          if [ "${{ inputs.dx12 }}" = "true" ]; then EXTRA="app/Madeira/libMoltenVK.a"; fi
+          for f in $EXTRA FEX/build-ios/FEXCore/Source/libFEXCore.a FEX/build-ios/FEXCore/Source/libFEXCore_Base.a FEX/build-ios/FEXCore/Source/libJemallocLibs.a FEX/build-ios/External/fmt/libfmt.a FEX/build-ios/External/cephes/libcephes_128bit.a FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a app/Madeira/libwineserver.a app/Madeira/libdxmt_combined.a app/Madeira/libgnutls.a app/Madeira/libhogweed.a app/Madeira/libnettle.a app/Madeira/libgmp.a; do
             if [ -f "$f" ]; then echo "  OK      $f  $(du -h "$f" | cut -f1)"; else echo "  MISSING $f"; MISSING=1; fi
           done
           if [ "$MISSING" -eq 1 ]; then echo "::error::a linked library is missing"; exit 1; fi
 
       - name: xcodebuild (unsigned)
         run: |
-          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -sdk iphoneos -derivedDataPath build-out CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > /tmp/xb.log 2>&1 || { grep -E 'error:|ld: |Undefined symbols|duplicate symbol' -A 3 /tmp/xb.log | sort -u | head -60; exit 1; }
+          # MoltenVK: -force_load, because its Objective-C category objects have
+          # no symbol anything references and would otherwise be left out.
+          # The project sets no OTHER_LDFLAGS, so nothing is overridden.
+          LDFLAGS_ARG=()
+          if [ "${{ inputs.dx12 }}" = "true" ]; then
+            LDFLAGS_ARG=("OTHER_LDFLAGS=-force_load $PWD/app/Madeira/libMoltenVK.a -framework IOSurface -framework CoreGraphics")
+          fi
+          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -sdk iphoneos -derivedDataPath build-out CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" "${LDFLAGS_ARG[@]}" build > /tmp/xb.log 2>&1 || { grep -E 'error:|ld: |Undefined symbols|duplicate symbol' -A 3 /tmp/xb.log | sort -u | head -60; exit 1; }
           tail -3 /tmp/xb.log
 
       - name: Package IPA
@@ -387,6 +491,15 @@ jobs:
             echo "::error::macdrv_functions missing from the export trie (DXMT would white-screen)"; exit 1
           fi
           echo "DLLs: aarch64 $(ls "$APP/aarch64-windows" | wc -l | tr -d ' '), arm64ec $(ls "$APP/arm64ec-windows" | wc -l | tr -d ' ')"
+          SUFFIX=""
+          if [ "${{ inputs.dx12 }}" = "true" ]; then
+            SUFFIX="-dx12"
+            # Proof by content that each D3D12 piece reached the binary.
+            for s in 'winevulkan_unix_call_funcs' '[vulkan-ios] metal surface' 'MoltenVK'; do
+              if grep -a -q -F "$s" "$BIN"; then echo "  binary has: $s"; else echo "::error::binary lacks: $s"; exit 1; fi
+            done
+            grep -a -q 'dxgi bridge: hooked factory vtable' "$APP/arm64ec-windows/d3d12core.dll" && echo "  d3d12core.dll has the DXGI bridge"
+          fi
           rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
           cat > Payload/entitlements.plist <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -397,7 +510,7 @@ jobs:
             <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
           </dict></plist>
           PLIST
-          zip -qry "Madeira-full-${GITHUB_RUN_NUMBER}.ipa" Payload
+          zip -qry "Madeira-full${SUFFIX}-${GITHUB_RUN_NUMBER}.ipa" Payload
           ls -lh Madeira-full-*.ipa
           echo "binary: $(du -h "$BIN" | cut -f1)"
 
@@ -414,5 +527,7 @@ jobs:
           path: |
             /tmp/xb.log
             /tmp/dxmt.log
+            /tmp/ntdll.log
+            /tmp/win32u.log
           retention-days: 7
           if-no-files-found: ignore
