@@ -1,0 +1,283 @@
+name: Build full IPA from source
+
+# The first workflow that builds EVERYTHING the app links, from a clean checkout,
+# and packages an unsigned IPA. Every step here was worked out separately first:
+#
+#   FEX for iOS            fex-ios.yml        toolchain file, TUNE_CPU=none,
+#                                             FEX_IOS_HOST, static targets only
+#   libntdll_unix.a        unix-libs.yml      wine configure + 345 IDL headers
+#   libwin32u_unix.a       unix-libs.yml      + gnutls/freetype for iOS
+#   libwineserver.a        unix-libs.yml      make-base.sh (all 44 sources)
+#   LLVM 15 for iOS        llvm-ios.yml       cached; AddLLVM Darwin|iOS, no tools
+#   libdxmt_combined.a     here               build.sh + libtool merge with LLVM
+#   44 Wine PE DLLs        wine-pe-dlls.yml   XAudio2 family etc, ARM64X hybrids
+#   x86_64 VC++ runtime    windows runner     WiX bundle defeats 7-Zip
+#
+# Nothing is published. The IPA is a private, expiring artifact.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  vcruntime:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Collect the x64 CRT from the Visual Studio redist
+        shell: pwsh
+        run: |
+          $wanted = @('concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll',
+                      'msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcamp140.dll',
+                      'vccorlib140.dll','vcomp140.dll','vcruntime140.dll',
+                      'vcruntime140_1.dll','vcruntime140_threads.dll')
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $roots = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Redist\MSVC' -Directory -ErrorAction SilentlyContinue
+          if (-not $roots) { Write-Error 'no VC Redist directory'; exit 1 }
+          foreach ($name in $wanted) {
+            $hit = Get-ChildItem -Path $roots.FullName -Recurse -Filter $name -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+            if ($hit) { Copy-Item $hit.FullName -Destination "out\$name"; "OK  $name" } else { "MISSING $name" }
+          }
+          if ((Get-ChildItem out).Count -lt 10) { Write-Error 'too few CRT DLLs'; exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: out/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  pe-dlls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fetch wine
+        run: git submodule update --init --depth 1 wine
+      - name: Host deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential flex bison pkg-config gettext autoconf perl python3 curl xz-utils
+      - name: Install llvm-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
+          if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
+          curl -fsSL "$URL" -o /tmp/lm.tar.xz
+          sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
+          echo "$(ls -d /opt/llvm-mingw-* | head -1)/bin" >> "$GITHUB_PATH"
+      - name: Configure wine (aarch64 + arm64ec PE)
+        working-directory: wine
+        run: |
+          ./configure --enable-archs=aarch64,arm64ec --without-x --without-freetype --without-fontconfig --without-alsa --without-oss --without-pulse --without-coreaudio --without-gstreamer --without-opengl --without-vulkan --disable-tests 2>&1 | tail -10
+      - name: Build the PE DLLs games miss
+        working-directory: wine
+        run: |
+          set -euo pipefail
+          T="xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7 xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5 xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinput9_1_0 d3d8 d3d10 d3d10_1 ddraw dinput msvcp100 msvcp110 msvcp120 msvcr100 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
+          make -j"$(nproc)" tools 2>&1 | tail -3
+          BUILT=0
+          for t in $T; do
+            if make -j"$(nproc)" "dlls/$t/aarch64-windows/$t.dll" > /tmp/m.log 2>&1; then BUILT=$((BUILT+1)); else echo "FAILED $t"; tail -3 /tmp/m.log; fi
+          done
+          echo "BUILT: $BUILT"
+          mkdir -p ../out
+          find dlls -path "*/aarch64-windows/*.dll" -exec cp {} ../out/ ';'
+          ls ../out | wc -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extra-pe-dlls
+          path: out/
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  ipa:
+    needs: [vcruntime, pe-dlls]
+    runs-on: macos-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Submodules (FEX, wine, dxmt - recursive for their externals)
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 FEX wine
+          git submodule update --init --depth 1 --recursive research/dxmt
+          (cd FEX && git submodule update --init --depth 1 --recursive External 2>&1 | tail -3) || true
+          for d in FEX wine research/dxmt; do echo "  $d $(du -sh "$d" | cut -f1)"; done
+
+      - name: Xcode 26
+        run: |
+          set -euo pipefail
+          NEWEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$NEWEST"
+          xcodebuild -version | head -1
+          SDKV=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK $SDKV"
+          if [ "${SDKV%%.*}" -lt 26 ]; then echo "::error::need iOS 26 SDK (glassEffect)"; exit 1; fi
+
+      - name: Host tools
+        run: |
+          brew install ninja bison flex python-packaging || true
+          python3 -c 'import packaging; print("packaging OK")'
+
+      - name: llvm-mingw (wine configure needs a PE cross-compiler)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-macos-universal.tar.xz")) | .browser_download_url')
+          if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
+          curl -fsSL "$URL" -o /tmp/lm.tar.xz
+          sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
+          echo "$(ls -d /opt/llvm-mingw-* | head -1)/bin" >> "$GITHUB_PATH"
+
+      # ---- FEX -----------------------------------------------------------
+      - name: FEXCore for iOS
+        run: bash build/fex-ios/build.sh 2>&1 | tail -15
+
+      # ---- Wine headers --------------------------------------------------
+      - name: Wine configure + IDL headers
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          mkdir -p wine/build-macos && cd wine/build-macos
+          ../configure --enable-win64 --without-x --without-freetype --without-fontconfig --without-gstreamer --without-vulkan --without-opengl --without-alsa --without-oss --without-pulse --without-sane --without-usb --without-capi --without-gphoto --disable-tests 2>&1 | tail -5
+          make -j"$(sysctl -n hw.ncpu)" tools 2>&1 | tail -3 || true
+          made=0
+          for idl in ../include/*.idl; do
+            if make "include/$(basename "$idl" .idl).h" >/dev/null 2>&1; then made=$((made+1)); fi
+          done
+          echo "IDL headers: $made"
+
+      # ---- Unix libraries ------------------------------------------------
+      - name: gnutls + freetype for iOS
+        run: |
+          set -euo pipefail
+          if [ ! -d research/freetype ]; then
+            git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          fi
+          bash build/gnutls-ios/build.sh 2>&1 | tail -6
+          bash build/freetype-ios/build.sh 2>&1 | tail -3
+
+      - name: libntdll_unix.a + libwin32u_unix.a
+        run: |
+          set -euo pipefail
+          bash build/ntdll-unix/build.sh 2>&1 | tail -6
+          bash build/win32u-unix/build.sh 2>&1 | tail -6
+
+      - name: libwineserver.a (base + patches)
+        run: |
+          set -euo pipefail
+          bash build/wineserver/make-base.sh 2>&1 | tail -8
+          bash build/wineserver/build.sh 2>&1 | tail -8
+
+      # ---- DXMT ----------------------------------------------------------
+      - name: Restore LLVM 15 for iOS
+        id: llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/llvm-ios-build
+          key: llvm-ios-llvmorg-15.0.7-v1
+
+      - name: LLVM source headers (DXMT includes both build and source trees)
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.llvm.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::LLVM iOS cache miss - run llvm-ios.yml first"; exit 1
+          fi
+          echo "iOS LLVM static libs: $(ls toolchains/llvm-ios-build/lib/*.a | wc -l | tr -d ' ')"
+          git clone --depth 1 --branch llvmorg-15.0.7 --filter=blob:none --sparse https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          (cd toolchains/llvm-project && git sparse-checkout set llvm/include)
+          ls toolchains/llvm-project/llvm/include | head -3
+
+      - name: libdxmt_combined.a
+        run: |
+          set -euo pipefail
+          xcodebuild -downloadComponent MetalToolchain 2>&1 | tail -2 || true
+          bash build/dxmt-ios/build.sh 2>&1 | tail -10
+          xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
+          ls -lh app/Madeira/libdxmt_combined.a
+
+      # ---- Assemble ------------------------------------------------------
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-vcruntime
+          path: app/Madeira/x86_64-vcruntime
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: extra-pe-dlls
+          path: extra-dlls
+
+      # ADD only. Upstream's DLLs carry iOS patches; never overwrite one. These
+      # are ARM64X hybrids, so the same file serves both directories.
+      - name: Merge extra DLLs without overwriting upstream's
+        run: |
+          set -euo pipefail
+          for dir in aarch64-windows arm64ec-windows; do
+            added=0
+            for f in extra-dlls/*.dll; do
+              n=$(basename "$f")
+              if [ ! -e "app/Madeira/$dir/$n" ]; then cp "$f" "app/Madeira/$dir/$n"; added=$((added+1)); fi
+            done
+            echo "$dir: +$added (now $(ls app/Madeira/$dir | wc -l | tr -d ' '))"
+          done
+          ls app/Madeira/arm64ec-windows | grep -E '^xaudio2_9|^x3daudio1_7' || echo "::warning::xaudio2 not merged"
+
+      - name: Every library the app links
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for f in FEX/build-ios/FEXCore/Source/libFEXCore.a FEX/build-ios/FEXCore/Source/libFEXCore_Base.a FEX/build-ios/FEXCore/Source/libJemallocLibs.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a app/Madeira/libwineserver.a app/Madeira/libdxmt_combined.a; do
+            if [ -f "$f" ]; then echo "  OK      $f  $(du -h "$f" | cut -f1)"; else echo "  MISSING $f"; MISSING=1; fi
+          done
+          if [ "$MISSING" -eq 1 ]; then echo "::error::a linked library is missing"; exit 1; fi
+
+      - name: xcodebuild (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -sdk iphoneos -derivedDataPath build-out CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > /tmp/xb.log 2>&1 || { grep -E 'error:|ld: ' /tmp/xb.log | sort -u | head -30; exit 1; }
+          tail -3 /tmp/xb.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=$(find build-out/Build/Products -maxdepth 2 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "::error::no .app"; exit 1; }
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          cat > Payload/entitlements.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>get-task-allow</key><true/>
+            <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+          </dict></plist>
+          PLIST
+          zip -qry "Madeira-full-${GITHUB_RUN_NUMBER}.ipa" Payload
+          ls -lh Madeira-full-*.ipa
+          echo "binary: $(du -h "$APP/$(basename "$APP" .app)" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-full-ipa
+          path: Madeira-full-*.ipa
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xcodebuild-log
+          path: /tmp/xb.log
+          retention-days: 7
