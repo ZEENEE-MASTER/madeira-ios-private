@@ -86,8 +86,10 @@ struct GameSessionView: View {
         }
         .modifier(ControllerHandler { input in
             let m = SessionOverlayModel.shared
+            // Menu and View belong to the game (Start / Back via XInput); the
+            // Home/Guide button is ours.
             switch input {
-            case .options, .menu: withAnimation(.easeOut(duration: 0.22)) { m.panelOpen.toggle() }
+            case .home: withAnimation(.easeOut(duration: 0.22)) { m.panelOpen.toggle() }
             case .back: if m.panelOpen { withAnimation(.easeOut(duration: 0.22)) { m.panelOpen = false } }
             default: break
             }
@@ -105,6 +107,9 @@ struct GameSessionView: View {
         m.launchError = nil
         SessionOverlayHost.attach()
         if game.profile.touchControls { TouchControlsHost.attach() }
+        GamepadBridge.shared.start()
+        GamepadBridge.shared.virtualPadEnabled = game.profile.touchControls
+            && TouchControlsModel.shared.controls.contains { $0.action.isPad }
         guard !launcher.hasStarted else { return }
         // The layer is registered with DXMT in MetalBackedView.didMoveToWindow;
         // give the hierarchy a moment to attach before the game can ask for it.
@@ -320,6 +325,8 @@ struct QuickAccessPanel: View {
                         }
                     }
                     group("Session") {
+                        Text("Controllers reach the game as XInput players 1-4. The Home button opens this panel.")
+                            .font(.system(size: 12)).foregroundStyle(Deck.dim)
                         Text("Frame limit, resolution and API are set per game on its page and apply at the next launch.")
                             .font(.system(size: 12)).foregroundStyle(Deck.dim)
                         Button(role: .destructive) { confirmQuit = true } label: {

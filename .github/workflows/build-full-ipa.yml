@@ -147,6 +147,42 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
+  # XInput for in-game controllers (build/xinput-madeira): Wine's xinput reads
+  # HID, which has no backend on iOS; these read GameController state directly.
+  xinput:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: build/xinput-madeira
+      - name: llvm-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
+          curl -fsSL "$URL" -o /tmp/lm.tar.xz
+          sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
+          echo "$(ls -d /opt/llvm-mingw-* | head -1)/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: bash build/xinput-madeira/build.sh "$PWD/out"
+      - name: Verify exports
+        run: |
+          for d in out/*.dll; do
+            llvm-objdump -p "$d" | grep -E 'XInputGetState|XInputSetState|XInputGetCapabilities' | head -3 || true
+            llvm-readobj --coff-load-config "$d" | grep -m1 -i 'CHPEMetadata' || echo "::warning::$d has no CHPE metadata"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinput-madeira
+          path: out/*.dll
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
   vkd3d:
     if: ${{ inputs.dx12 }}
     uses: ./.github/workflows/vkd3d-proton-pe.yml
@@ -156,9 +192,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   ipa:
-    needs: [vcruntime, pe-dlls, vkd3d]
+    needs: [vcruntime, pe-dlls, xinput, vkd3d]
     # vkd3d is skipped when dx12 is off; that must not skip this job.
-    if: ${{ !cancelled() && needs.vcruntime.result == 'success' && needs.pe-dlls.result == 'success' && (needs.vkd3d.result == 'success' || needs.vkd3d.result == 'skipped') }}
+    if: ${{ !cancelled() && needs.vcruntime.result == 'success' && needs.pe-dlls.result == 'success' && needs.xinput.result == 'success' && (needs.vkd3d.result == 'success' || needs.vkd3d.result == 'skipped') }}
     runs-on: macos-latest
     timeout-minutes: 330
     # Explicit `shell: bash` means -eo pipefail. The implicit default is
@@ -433,6 +469,11 @@ jobs:
           path: extra-dlls
 
       - uses: actions/download-artifact@v4
+        with:
+          name: xinput-madeira
+          path: xinput-dlls
+
+      - uses: actions/download-artifact@v4
         if: ${{ inputs.dx12 }}
         with:
           name: vkd3d-proton-arm64ec
@@ -452,7 +493,15 @@ jobs:
           done
           ls app/Madeira/arm64ec-windows | grep -E '^xaudio2_9|^x3daudio1_7' || echo "::warning::xaudio2 not merged"
 
-      # The one deliberate REPLACE. Upstream's d3d12.dll is Wine's vkd3d build,
+      # Deliberate REPLACE: Wine's xinput talks to HID, which iOS does not have.
+      - name: XInput DLLs (controllers)
+        run: |
+          for dir in aarch64-windows arm64ec-windows; do
+            cp xinput-dlls/*.dll "app/Madeira/$dir/"
+            ls -l app/Madeira/$dir/xinput*.dll
+          done
+
+      # The other deliberate REPLACE. Upstream's d3d12.dll is Wine's vkd3d build,
       # which needs Wine's own dxgi.dll for swapchains and can never present
       # through DXMT's. vkd3d-proton's d3d12.dll + d3d12core.dll (with the DXGI
       # bridge) take its place; winevulkan.dll and vulkan-1.dll come from the

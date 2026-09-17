@@ -1959,7 +1959,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
-    case pad(String)         // ml645: Xbox button. NOT WIRED — see the panel.
+    case pad(String)         // Xbox button -> GamepadBridge virtual pad (slot 0) -> XInput
 
     /// The four keys a stick drives, up/right/down/left. nil for non-sticks.
     var stickKeys: [Int32]? {
@@ -2255,8 +2255,7 @@ struct TouchControlButton: View {
                 Text(control.action.label)
                     .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
                                   weight: .medium))
-                    .foregroundStyle(.white.opacity(control.action.isPad ? 0.45
-                                                    : (isDown ? 1.0 : 0.85)))
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
             }
         }
         .frame(width: diameter, height: diameter)
@@ -2368,8 +2367,8 @@ struct TouchControlButton: View {
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows:
             break                                              // sticks drive themselves
-        case .pad:
-            break     // ml645: no XInput yet — deliberately inert, and labelled so
+        case .pad(let name):
+            GamepadBridge.shared.setVirtual(name, down: down)
         }
     }
 }
@@ -2507,10 +2506,10 @@ struct MappingPanel: View {
 
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("XInput isn't wired up yet. These save with your layout but do "
-                 + "nothing when pressed — controller support lands with the Wine HID stack.")
+            Text("These press buttons on a virtual Xbox controller (player 1), merged with "
+                 + "any real controller in that slot. Games see it through XInput.")
                 .font(.system(size: 11))
-                .foregroundStyle(.orange.opacity(0.95))
+                .foregroundStyle(.white.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
             section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
             section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
@@ -2547,7 +2546,7 @@ struct MappingPanel: View {
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
-                .foregroundStyle(.white.opacity(action.isPad ? 0.55 : 1.0))
+                .foregroundStyle(.white.opacity(1.0))
                 .frame(maxWidth: .infinity, minHeight: 30)
                 .background(RoundedRectangle(cornerRadius: 7)
                     .fill(.white.opacity(on ? 0.36 : 0.12)))

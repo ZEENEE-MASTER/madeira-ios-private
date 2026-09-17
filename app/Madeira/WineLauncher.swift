@@ -202,6 +202,8 @@ final class WineLauncher: ObservableObject {
         }
         for k in p.unset where p.env[k] == nil { unsetenv(k) }
         for (k, v) in p.env { setenv(k, v, 1) }
+        GamepadBridge.shared.start()
+        setenv("MADEIRA_PAD_SHM", GamepadBridge.shared.environmentValue, 1)
         madeira_set_vsync_locked(p.vsyncLocked ? 1 : 0)
         ProMotionIntent.shared.setActive(!p.vsyncLocked)
         madeira_set_diag_enabled(game.profile.verboseLogging ? 1 : 0)

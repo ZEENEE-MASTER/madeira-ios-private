@@ -67,7 +67,7 @@ struct DeckButtonStyle: ButtonStyle {
 final class ControllerHub: ObservableObject {
     static let shared = ControllerHub()
 
-    enum Input { case up, down, left, right, confirm, back, menu, options, shoulderLeft, shoulderRight }
+    enum Input { case up, down, left, right, confirm, back, menu, options, home, shoulderLeft, shoulderRight }
 
     @Published private(set) var connected: GCController?
     /// Disabled while a game session owns the screen.
@@ -114,6 +114,10 @@ final class ControllerHub: ObservableObject {
         bind(pad.buttonB, .back)
         bind(pad.buttonMenu, .menu)
         bind(pad.buttonOptions, .options)
+        bind(pad.buttonHome, .home)
+        // The Home/Guide button opens Quick Access in game. Without this iOS
+        // takes it for its own Game Center / launcher gesture.
+        pad.buttonHome?.preferredSystemGestureState = .disabled
         bind(pad.leftShoulder, .shoulderLeft)
         bind(pad.rightShoulder, .shoulderRight)
         pad.dpad.valueChangedHandler = { _, x, y in
@@ -249,9 +253,10 @@ struct RootView: View {
         .onAppear {
             UIDevice.current.isBatteryMonitoringEnabled = true
             jit_install_trap_handler()
+            GamepadBridge.shared.start()   // before any launch: publishes MADEIRA_PAD_SHM
         }
         .modifier(ControllerHandler { input in
-            if input == .menu { withAnimation(.easeOut(duration: 0.2)) { menuOpen.toggle() } }
+            if input == .menu || input == .home { withAnimation(.easeOut(duration: 0.2)) { menuOpen.toggle() } }
         })
     }
 }

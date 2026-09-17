@@ -355,6 +355,9 @@ struct GameEntry: Codable, Identifiable, Equatable, Hashable {
         if detected.exeBytes > 400 * 1024 * 1024 {
             n.append("Very large executable (\(ByteCountFormatter.string(fromByteCount: detected.exeBytes, countStyle: .file))). Its image is copied into the JIT pool, which counts against the memory limit.")
         }
+        if detected.engine.isUnreal && profile.api == .auto {
+            n.append("Unreal picks its renderer at launch. If the game reports a DirectX error, set Graphics API to DirectX 12.")
+        }
         if resolvedAPI == .dx12 {
             n.append("DirectX 12 runs through vkd3d-proton and MoltenVK: no mesh shaders, no ray tracing, feature level 12_1 at most.")
         }
