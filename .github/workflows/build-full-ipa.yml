@@ -172,6 +172,14 @@ jobs:
         with:
           fetch-depth: 1
 
+      # FEX always, and BEFORE any cache restore: the app compiles against
+      # FEX's headers, and restoring FEX/build-ios first leaves a non-empty
+      # FEX/ that git then refuses to clone the submodule into.
+      - name: FEX submodule
+        run: |
+          git submodule update --init --depth 1 FEX
+          (cd FEX && git submodule update --init --depth 1 --recursive External 2>&1 | tail -3) || true
+
       - name: Cache keys
         id: keys
         run: |
@@ -222,9 +230,6 @@ jobs:
 
       - name: Submodules (only those still to build)
         run: |
-          # FEX always: the app itself compiles against FEX's headers.
-          git submodule update --init --depth 1 FEX
-          (cd FEX && git submodule update --init --depth 1 --recursive External 2>&1 | tail -3) || true
           if [ "${{ steps.unix.outputs.cache-hit }}" != "true" ]; then
             git submodule update --init --depth 1 wine
           fi
