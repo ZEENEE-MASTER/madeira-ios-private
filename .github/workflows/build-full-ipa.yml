@@ -303,8 +303,14 @@ jobs:
       - name: MoltenVK exports what win32u binds to
         if: ${{ inputs.dx12 }}
         run: |
-          for sym in vkGetInstanceProcAddr vkGetDeviceProcAddr vkCreateMetalSurfaceEXT; do
-            if nm -g app/Madeira/libMoltenVK.a 2>/dev/null | grep -q " T _$sym$"; then echo "  OK      $sym"; else echo "  MISSING $sym"; exit 1; fi
+          # Only these two are bound by name (vulkan_ios.c). Everything else,
+          # vkCreateMetalSurfaceEXT included, comes through vkGetInstanceProcAddr
+          # and is not a global symbol in the static library.
+          # nm output goes to a file: `nm | grep -q` under pipefail can fail on
+          # SIGPIPE when grep exits early.
+          nm -g app/Madeira/libMoltenVK.a > /tmp/mvk.nm 2>/dev/null || true
+          for sym in vkGetInstanceProcAddr vkGetDeviceProcAddr; do
+            if grep -q " T _$sym$" /tmp/mvk.nm; then echo "  OK      $sym"; else echo "  MISSING $sym"; exit 1; fi
           done
 
       # ---- Wine unix side ------------------------------------------------
