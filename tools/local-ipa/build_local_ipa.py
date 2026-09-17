@@ -120,7 +120,16 @@ def insert_load_dylib(path, dylib):
 
 
 def main():
-    base = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else IPA_DIR / "Madeira-full-dx12-5.ipa"
+    if len(sys.argv) > 1:
+        base = pathlib.Path(sys.argv[1])
+    else:
+        # Newest IPA in the folder: re-injecting into our own output is fine
+        # (the load command is added only once) and survives cleanups of the
+        # original CI build.
+        found = sorted(IPA_DIR.glob("Madeira-*.ipa"), key=lambda p: p.stat().st_mtime)
+        if not found:
+            sys.exit(f"no base IPA in {IPA_DIR}")
+        base = found[-1]
     n = 1
     while (IPA_DIR / f"Madeira-local-{n}.ipa").exists():
         n += 1

@@ -31,30 +31,52 @@ static uint32_t g_last_rumble[SLOTS];
 static id g_rumble[SLOTS];          // MPRumble
 static dispatch_queue_t g_queue;
 
-#pragma mark - image-base reservation
+#pragma mark - image base vs JIT pool
 
-// Why this exists: a Windows executable built with relocations stripped can
-// ONLY be mapped at its preferred base. Unreal shipping binaries use
-// 0x140000000, and protected ones (Stellar Blade's SB-Win64-Shipping.exe) have
-// no .reloc at all. Madeira's JIT pool is allocated later by StikDebug with
-// VM_FLAGS_ANYWHERE, after pin chunks push the allocator past 0x119000000, so
-// it repeatedly lands across 0x140000000 — and Wine then dies with
+// The problem this solves
+// -----------------------
+// A Windows executable built with relocations stripped can ONLY be mapped at
+// its preferred base. Unreal shipping binaries use 0x140000000; protected ones
+// (Stellar Blade's SB-Win64-Shipping.exe, 314 MB) have no .reloc at all. When
+// something else owns that address Wine dies with
 //   wine: failed to create main module ... status c0000018
-// (ntdll's perform_relocations: "need to relocate but there are no relocation
-// records" = STATUS_CONFLICTING_ADDRESSES).
+// (ntdll perform_relocations: "no relocation records" = CONFLICTING_ADDRESSES).
 //
-// So: reserve that band here, at dylib load, long before the pool exists. The
-// pool cannot overlap a reserved range, so the kernel places it elsewhere. The
-// band is released the moment the pool address is published (WINE_IOS_JIT_RX),
-// which is after the pool is allocated and before Wine maps any image.
+// On this device the only usable free span is roughly
+//   0x11a000000 .. 0x158000000     (~1 GB; above it iOS's own mappings run
+//                                    until the forbidden 0x70_0000_0000 window)
+// and the JIT pool must start above 0x119000000 (FEX emit bug below that). So a
+// 896 MB pool ALWAYS covers 0x140000000, and simply reserving the game's band
+// leaves no 896 MB hole at all — the kernel then hands back 0x7000000000, which
+// the app rejects ("BAD POOL placement ... Killing in 10s"). That is the crash
+// this build fixes.
 //
-// Reserve-only (VM_PROT_NONE, never touched), so it costs address space and no
-// memory. Documents/madeira-imagebase.txt overrides it: "<hex base> <MB>", or
-// "0" to disable.
+// The only arrangement that satisfies everyone is a SMALLER pool that ends
+// below the image base:
+//   [pool: ~0x11b000000 .. <0x140000000]  [image: 0x140000000 .. +SizeOfImage]
+// so this code, when (and only when) the launch target is a relocation-stripped
+// executable:
+//   1. reads its PE header for ImageBase / SizeOfImage,
+//   2. probes where the kernel is currently allocating,
+//   3. writes Documents/madeira-pool.txt with the largest 64 MB-aligned pool
+//      that still ends below ImageBase (the app already honours that file),
+//   4. reserves the image band so the pool cannot creep into it, releasing it
+//      once the pool address is published and before Wine maps anything.
+// Anything else (desktop, Steam, Stray, Thumper) runs with the stock 896 MB
+// pool and no reservation.
+//
+// Documents/madeira-imagebase.txt overrides: "<hex base> <MB>", or "0" to
+// disable the whole mechanism.
 
-static vm_address_t g_hold_base = 0x140000000ULL;
-static vm_size_t g_hold_size = 0x20000000ULL;      // 512 MB, covers a 314 MB image
+#define FEX_POOL_FLOOR   0x119000000ULL   // StikJITHelper's low bound
+#define POOL_GRAIN       (64ULL << 20)
+#define POOL_MIN_MB      256
+#define POOL_MAX_MB      896
+
+static vm_address_t g_hold_base;
+static vm_size_t g_hold_size;
 static BOOL g_hold_active;
+static BOOL g_hold_disabled;
 
 static void hold_image_band(void)
 {
@@ -65,14 +87,13 @@ static void hold_image_band(void)
     kern_return_t kr = vm_allocate(mach_task_self(), &addr, g_hold_size, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS || addr != g_hold_base) {
         if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), addr, g_hold_size);
-        fprintf(stderr, "[madeira-pad] image band 0x%llx+%lluMB NOT reserved (kr=%d) — "
-                        "relocation-stripped games may fail with c0000018\n",
+        fprintf(stderr, "[madeira-pad] image band 0x%llx+%lluMB NOT reserved (kr=%d)\n",
                 (unsigned long long)g_hold_base, (unsigned long long)(g_hold_size >> 20), kr);
         return;
     }
     vm_protect(mach_task_self(), addr, g_hold_size, FALSE, VM_PROT_NONE);
     g_hold_active = YES;
-    fprintf(stderr, "[madeira-pad] image band reserved 0x%llx..0x%llx (JIT pool must go elsewhere)\n",
+    fprintf(stderr, "[madeira-pad] image band reserved 0x%llx..0x%llx\n",
             (unsigned long long)g_hold_base, (unsigned long long)(g_hold_base + g_hold_size));
 }
 
@@ -81,16 +102,118 @@ static void release_image_band(const char *pool_rx)
     if (!g_hold_active) return;
     vm_deallocate(mach_task_self(), g_hold_base, g_hold_size);
     g_hold_active = NO;
-    unsigned long long rx = pool_rx ? strtoull(pool_rx, NULL, 16) : 0;
-    const char *verdict = "";
-    if (rx) {
-        // 896 MB default pool; only the overlap verdict matters here.
-        unsigned long long pool_end = rx + (896ULL << 20);
-        verdict = (rx < g_hold_base + g_hold_size && pool_end > g_hold_base)
-                  ? " ** POOL STILL OVERLAPS — relocation-stripped games will fail **" : " (pool clear)";
+    fprintf(stderr, "[madeira-pad] image band released for the loader (pool RX=%s)\n",
+            pool_rx ? pool_rx : "?");
+}
+
+/// Where is the kernel handing out memory right now? Allocate and immediately
+/// free a probe: the JIT pool lands just above this, after the app's pin chunks.
+static unsigned long long probe_frontier(void)
+{
+    vm_address_t addr = 0;
+    if (vm_allocate(mach_task_self(), &addr, 16 << 20, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
+    vm_deallocate(mach_task_self(), addr, 16 << 20);
+    return (unsigned long long)addr;
+}
+
+/// ImageBase / SizeOfImage / relocations-stripped from a PE file, or 0.
+static BOOL read_pe_layout(NSString *unixPath, unsigned long long *base, unsigned long long *size, BOOL *stripped)
+{
+    NSData *d = [NSData dataWithContentsOfFile:unixPath options:NSDataReadingMappedIfSafe error:nil];
+    if (d.length < 0x400) return NO;
+    const uint8_t *b = d.bytes;
+    if (b[0] != 'M' || b[1] != 'Z') return NO;
+    uint32_t pe;
+    memcpy(&pe, b + 0x3c, 4);
+    if (pe + 0x100 > d.length) return NO;
+    uint32_t sig;
+    memcpy(&sig, b + pe, 4);
+    if (sig != 0x00004550) return NO;
+    uint16_t chars, magic;
+    memcpy(&chars, b + pe + 22, 2);
+    memcpy(&magic, b + pe + 24, 2);
+    if (magic != 0x20b) return NO;                     // PE32+ only
+    memcpy(base, b + pe + 24 + 24, 8);
+    uint32_t sz;
+    memcpy(&sz, b + pe + 24 + 56, 4);
+    *size = sz;
+    *stripped = (chars & 0x0001) != 0;                 // IMAGE_FILE_RELOCS_STRIPPED
+    return YES;
+}
+
+/// C:\... -> <Documents>/wine/drive_c/...
+static NSString *windows_to_unix(NSString *docs, NSString *win)
+{
+    if (win.length < 3 || ![[win substringWithRange:NSMakeRange(1, 2)] isEqualToString:@":\\"]) return nil;
+    NSString *rest = [[win substringFromIndex:3] stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+    return [docs stringByAppendingPathComponent:[@"wine/drive_c/" stringByAppendingString:rest]];
+}
+
+/// Sizes the JIT pool so it ends below `image_base`, and reserves the band.
+/// The marker file records that madeira-pool.txt is ours to manage.
+static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
+{
+    NSString *poolFile = [docs stringByAppendingPathComponent:@"madeira-pool.txt"];
+    NSString *marker = [docs stringByAppendingPathComponent:@".madeira-pad-pool"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    NSString *unixExe = winExe ? windows_to_unix(docs, winExe) : nil;
+    unsigned long long base = 0, size = 0;
+    BOOL stripped = NO;
+    BOOL needs_fixed_base = unixExe && read_pe_layout(unixExe, &base, &size, &stripped) && stripped && base && size;
+
+    if (!needs_fixed_base || g_hold_disabled) {
+        // Hand the stock 896 MB pool back if we were the one who shrank it.
+        if ([fm fileExistsAtPath:marker]) {
+            [fm removeItemAtPath:poolFile error:nil];
+            [fm removeItemAtPath:marker error:nil];
+            fprintf(stderr, "[madeira-pad] restored the default JIT pool (no fixed-base target)\n");
+        }
+        if (needs_fixed_base && g_hold_disabled)
+            fprintf(stderr, "[madeira-pad] fixed-base handling disabled by madeira-imagebase.txt\n");
+        return;
     }
-    fprintf(stderr, "[madeira-pad] image band released for the loader; pool RX=%s%s\n",
-            pool_rx ? pool_rx : "?", verdict);
+
+    if (!g_hold_base) {
+        g_hold_base = (vm_address_t)base;
+        g_hold_size = (vm_size_t)((size + POOL_GRAIN - 1) & ~(POOL_GRAIN - 1));
+    }
+
+    unsigned long long frontier = probe_frontier();
+    unsigned long long pool_start = frontier > FEX_POOL_FLOOR ? frontier : FEX_POOL_FLOOR;
+    pool_start += 64ULL << 20;                       // pin chunks + app allocations still to come
+    unsigned long long room = g_hold_base > pool_start ? g_hold_base - pool_start : 0;
+    unsigned long long mb = (room / POOL_GRAIN) * (POOL_GRAIN >> 20);
+    if (mb > POOL_MAX_MB) mb = POOL_MAX_MB;
+
+    fprintf(stderr, "[madeira-pad] %s: ImageBase=0x%llx size=%lluMB relocs-stripped -> must load fixed\n",
+            winExe.lastPathComponent.UTF8String, base, size >> 20);
+    fprintf(stderr, "[madeira-pad]   allocator frontier 0x%llx, room below image 0x%llx = %lluMB\n",
+            frontier, room, room >> 20);
+
+    if (mb < POOL_MIN_MB) {
+        fprintf(stderr, "[madeira-pad]   too little room for a usable pool — leaving everything stock; "
+                        "this title cannot load in this layout\n");
+        g_hold_size = 0;
+        if ([fm fileExistsAtPath:marker]) {
+            [fm removeItemAtPath:poolFile error:nil];
+            [fm removeItemAtPath:marker error:nil];
+        }
+        return;
+    }
+
+    NSString *existing = [NSString stringWithContentsOfFile:poolFile encoding:NSUTF8StringEncoding error:nil];
+    BOOL ours = [fm fileExistsAtPath:marker];
+    if (existing.length && !ours) {
+        fprintf(stderr, "[madeira-pad]   keeping your madeira-pool.txt (%s MB)\n",
+                [existing stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].UTF8String);
+    } else {
+        NSString *value = [NSString stringWithFormat:@"%llu\n", mb];
+        [value writeToFile:poolFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [@"written by MadeiraPad.dylib\n" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fprintf(stderr, "[madeira-pad]   JIT pool set to %lluMB so it ends below the image base\n", mb);
+    }
+    hold_image_band();
 }
 
 #pragma mark - launch override (setenv / unsetenv interposition)
@@ -316,17 +439,15 @@ static void madeira_pad_init(void)
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSFileManager *fm = NSFileManager.defaultManager;
 
-        // Before anything else allocates: keep the classic Windows image base free.
         NSString *ib = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-imagebase.txt"]
                                                 encoding:NSUTF8StringEncoding error:nil];
         if (ib.length) {
             NSArray<NSString *> *f = [ib.lowercaseString componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             unsigned long long base = f.count > 0 ? strtoull(f[0].UTF8String, NULL, 16) : 0;
-            unsigned long long mb = f.count > 1 ? strtoull(f[1].UTF8String, NULL, 10) : 512;
-            if (!base) { g_hold_size = 0; fprintf(stderr, "[madeira-pad] image band disabled by madeira-imagebase.txt\n"); }
-            else { g_hold_base = (vm_address_t)base; g_hold_size = (vm_size_t)(mb << 20); }
+            unsigned long long mb = f.count > 1 ? strtoull(f[1].UTF8String, NULL, 10) : 0;
+            if (!base) g_hold_disabled = YES;
+            else { g_hold_base = (vm_address_t)base; if (mb) g_hold_size = (vm_size_t)(mb << 20); }
         }
-        hold_image_band();
 
         // Persistent caches (Documents is never purged; Library/Caches is).
         NSString *dxmt = [docs stringByAppendingPathComponent:@"madeira-cache/dxmt/"];
@@ -354,6 +475,11 @@ static void madeira_pad_init(void)
                 fprintf(stderr, "[madeira-pad] madeira-launch.txt: exe=%s args=%s\n", exe.UTF8String, g_override_args.UTF8String);
             }
         }
+
+        // Pool size and image band depend on what is about to be launched, so
+        // this runs after the launch file is read and before anything big is
+        // allocated.
+        plan_for_fixed_base_image(docs, g_override_exe);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
