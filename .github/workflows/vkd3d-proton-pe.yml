@@ -73,26 +73,34 @@ jobs:
             https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d
           cd vkd3d && git log --oneline -1
 
-      # dxbc-spirv (pinned by v3.0.1) uses std::launder without including
-      # <new>. LLVM 23's libc++ stopped providing it transitively, which shows
-      # up as "no matching member function for call to 'move'" (substitution
-      # failure). Upstream fixed it in 83b38d4f8 on 2026-08-20; apply the same
-      # one-line include. An older llvm-mingw is not a way round it: 20260519
-      # fails meson's sanity check under -marm64x.
-      - name: Patch dxbc-spirv small_vector include
-        working-directory: vkd3d
+      # vkd3d-proton v3.0.1's shader compilers predate LLVM 23's libc++, which
+      # stopped including headers transitively. Two separate failures so far:
+      #   dxbc-spirv util_small_vector.h: std::launder without <new>
+      #     (upstream fixed it in 83b38d4f8, 2026-08-20)
+      #   dxil-spirv scratch_pool.hpp:59: std::terminate without <exception>
+      # Rather than patch files one run at a time, force-include the standard
+      # headers into every C++ translation unit. An older llvm-mingw is not a
+      # way round it: 20260519 fails meson's compiler sanity check.
+      - name: libc++ compatibility pre-include
         run: |
           set -euo pipefail
-          F=$(find subprojects -path '*dxbc-spirv/util/util_small_vector.h' | head -1)
-          if [ -z "$F" ]; then echo "::error::util_small_vector.h not found"; exit 1; fi
-          if grep -q '#include <new>' "$F"; then
-            echo "already includes <new>"
-          else
-            FIRST=$(grep -n '^#include' "$F" | head -1 | cut -d: -f1)
-            sed -i "${FIRST}i #include <new>" "$F"
-            echo "patched $F"
-          fi
-          grep -n '^#include' "$F" | sed 's/^/  /'
+          cat > "$PWD/libcxx-compat.hpp" <<'HPP'
+          #pragma once
+          #include <algorithm>
+          #include <cstdint>
+          #include <cstdlib>
+          #include <cstring>
+          #include <exception>
+          #include <functional>
+          #include <limits>
+          #include <memory>
+          #include <new>
+          #include <stdexcept>
+          #include <string>
+          #include <utility>
+          #include <vector>
+          HPP
+          echo "LIBCXX_COMPAT=$PWD/libcxx-compat.hpp" >> "$GITHUB_ENV"
 
       # Upstream's build-arm64ec.txt names arm64ec-w64-mingw32-gcc/g++. llvm-mingw
       # provides clang wrappers under those triples, so point at clang
@@ -112,7 +120,7 @@ jobs:
           [properties]
           needs_exe_wrapper = true
           c_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections']
-          cpp_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections']
+          cpp_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections', '-include', 'LIBCXX_COMPAT_PATH']
           c_link_args = ['-marm64x']
           cpp_link_args = ['-marm64x']
 
@@ -122,6 +130,7 @@ jobs:
           cpu = 'aarch64'
           endian = 'little'
           INI
+          sed -i "s#LIBCXX_COMPAT_PATH#$LIBCXX_COMPAT#" cross-arm64ec.txt
           sed 's/^/  /' cross-arm64ec.txt
 
       - name: Configure
@@ -134,7 +143,13 @@ jobs:
         working-directory: vkd3d
         run: |
           set -euo pipefail
-          ninja -C build 2>&1 | tail -30
+          # -k 0: keep going past the first failure so one run reports every
+          # broken translation unit, not just the first.
+          if ! ninja -C build -k 0 > ninja.log 2>&1; then
+            grep -E 'error:|FAILED:' ninja.log | sort -u | head -80
+            exit 1
+          fi
+          tail -5 ninja.log
 
       - name: Collect and verify ARM64X
         run: |
