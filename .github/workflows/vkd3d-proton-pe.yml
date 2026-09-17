@@ -1,0 +1,143 @@
+name: Build vkd3d-proton (D3D12) for ARM64EC
+
+# The PE half of DX12. vkd3d-proton translates D3D12 to Vulkan; MoltenVK then
+# takes Vulkan to Metal.
+#
+# The other fork (Madeira-FF7, build/vkd3d-proton-ios) stopped at a stub that
+# returns E_NOTIMPL, citing "VKD3D-Proton's baseline profile requires
+# geometryShader = true". Checked against current source, that is not the case:
+# libs/vkd3d/device.c only TRACE-logs geometryShader (line 2106). What it
+# actually hard-fails on is
+#
+#   samplerMirrorClampToEdge, Robustness2 (+ null descriptor),
+#   shaderDrawParameters, push descriptors, maintenance5/maintenance6
+#
+# and MoltenVK's MVKExtensions.def declares every one of those. So a D3D12
+# device should initialise on MoltenVK. Absent in MoltenVK: mesh shaders and ray
+# tracing -- that caps DX12 at feature level 12_0/12_1 with no DXR, which is a
+# real ceiling for Nanite-class UE5.
+#
+# ARM64EC because x86-64 games run under FEX in ARM64EC processes, and an ARM64EC
+# process cannot load a pure-ARM64 DLL. vkd3d-proton ships build-arm64ec.txt for
+# exactly this; it builds ARM64X hybrids (-marm64x), like the Wine PE DLLs.
+#
+# This produces d3d12.dll + d3d12core.dll. It does NOT yet make DX12 work: the
+# Vulkan calls still need winevulkan's UNIX side built for iOS and linked against
+# libMoltenVK.a, which does not exist in Madeira. See BUILD-NOTES.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "vkd3d-proton tag"
+        default: "v3.0.1"
+
+permissions:
+  contents: read
+
+jobs:
+  vkd3d:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Host tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends meson ninja-build glslang-tools python3 curl xz-utils
+          meson --version
+          glslangValidator --version | head -1
+
+      - name: Install llvm-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
+          if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
+          curl -fsSL "$URL" -o /tmp/lm.tar.xz
+          sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
+          DIR=$(ls -d /opt/llvm-mingw-* | head -1)
+          echo "$DIR/bin" >> "$GITHUB_PATH"
+          echo "LLVM_MINGW=$DIR" >> "$GITHUB_ENV"
+          ls "$DIR/bin" | grep -E '^arm64ec-w64-mingw32-(clang|widl|ar|strip)' | sed 's/^/  /'
+
+      - name: Clone vkd3d-proton (recursive)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.ref }}" --recurse-submodules --shallow-submodules \
+            https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d
+          cd vkd3d && git log --oneline -1
+
+      # Upstream's build-arm64ec.txt names arm64ec-w64-mingw32-gcc/g++. llvm-mingw
+      # provides clang wrappers under those triples, so point at clang
+      # explicitly rather than depend on gcc-named aliases existing.
+      - name: Cross file for llvm-mingw
+        run: |
+          set -euo pipefail
+          cat > cross-arm64ec.txt <<'INI'
+          [binaries]
+          c = 'arm64ec-w64-mingw32-clang'
+          cpp = 'arm64ec-w64-mingw32-clang++'
+          ar = 'arm64ec-w64-mingw32-ar'
+          strip = 'arm64ec-w64-mingw32-strip'
+          widl = 'arm64ec-w64-mingw32-widl'
+          widl-mingw-tools-fallback = 'arm64ec-w64-mingw32-widl'
+
+          [properties]
+          needs_exe_wrapper = true
+          c_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections']
+          cpp_args = ['-march=armv8.2-a', '-marm64x', '-O2', '-ffunction-sections', '-fdata-sections']
+          c_link_args = ['-marm64x']
+          cpp_link_args = ['-marm64x']
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          INI
+          sed 's/^/  /' cross-arm64ec.txt
+
+      - name: Configure
+        working-directory: vkd3d
+        run: |
+          set -euo pipefail
+          meson setup build --cross-file ../cross-arm64ec.txt --buildtype release -Denable_tests=false -Denable_extras=false 2>&1 | tail -30
+
+      - name: Build
+        working-directory: vkd3d
+        run: |
+          set -euo pipefail
+          ninja -C build 2>&1 | tail -30
+
+      - name: Collect and verify ARM64X
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find vkd3d/build -name 'd3d12*.dll' -exec cp {} out/ ';'
+          ls -lh out/
+          python3 - <<'PY'
+          import struct, pathlib
+          M = {0xaa64: "ARM64", 0xa641: "ARM64EC", 0x8664: "x86-64"}
+          ok = False
+          for f in sorted(pathlib.Path("out").glob("*.dll")):
+              d = f.read_bytes()
+              pe = struct.unpack_from("<I", d, 0x3c)[0]
+              mach = struct.unpack_from("<H", d, pe + 4)[0]
+              opt = pe + 24
+              magic = struct.unpack_from("<H", d, opt)[0]
+              dirs = opt + (112 if magic == 0x20b else 96)
+              _, lcsz = struct.unpack_from("<II", d, dirs + 10 * 8)
+              hybrid = "ARM64X hybrid" if lcsz >= 0x140 else "not hybrid"
+              print(f"  {f.name:<16} machine={M.get(mach, hex(mach))} loadcfg={lcsz:#x} -> {hybrid}")
+              ok = True
+          if not ok:
+              raise SystemExit("no d3d12 DLLs produced")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkd3d-proton-arm64ec
+          path: out/
+          retention-days: 7
