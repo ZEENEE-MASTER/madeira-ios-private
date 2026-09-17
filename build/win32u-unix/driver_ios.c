@@ -62,6 +62,10 @@ extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
 
 static struct user_driver_funcs winios_user_driver;
 
+/* Vulkan surfaces on the IOSDisplayShim CAMetalLayer (vulkan_ios_drv.c). Inert
+ * unless win32u found MoltenVK (vulkan_ios.c, MADEIRA_MOLTENVK). */
+extern UINT winios_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs );
+
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
  * types). Call this from pProcessEvents drain or directly from a
@@ -1581,6 +1585,8 @@ static void load_display_driver(void)
             dprintf( 2, "[winios] desktop mode: window-surface compositing ENABLED\n" );
         }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
+        /* D3D12 via vkd3d-proton -> winevulkan -> MoltenVK presents here. */
+        winios_user_driver.pVulkanInit = winios_VulkanInit;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );

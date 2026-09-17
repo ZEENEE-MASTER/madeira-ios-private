@@ -18,6 +18,7 @@ FAILED_FILES=""
 compile_one() {
     local src=$1
     local name=$2
+    shift 2
     echo -n "  $name... "
 
     if xcrun -sdk iphoneos clang \
@@ -36,6 +37,7 @@ compile_one() {
         -DWINE_UNIX_LIB -DWINE_IOS=1 \
         -Dget_thread_context=ntdll_get_thread_context \
         -Dset_thread_context=ntdll_set_thread_context \
+        "$@" \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
@@ -116,6 +118,32 @@ compile_unixlib "$CRYPTO_DIR/crypt32_unixlib_ios.c" "crypt32_unixlib" "crypt32" 
 # tables (nsiproxy.sys is not shipped; PE nsi.dll falls back to this).
 compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
 
+# D3D12 path: winevulkan's unix side (vulkan.c + generated vulkan_thunks.c),
+# registered by name in virtual_ios.c. It needs a Vulkan implementation behind
+# win32u, so it is built only alongside MoltenVK (app/Madeira/libMoltenVK.a, see
+# build/win32u-unix/vulkan_ios.c); otherwise winevulkan.dll keeps getting the
+# stub table and D3D12 fails cleanly at vkCreateInstance, as before.
+MOLTENVK_LIB="$REPO_ROOT/app/Madeira/libMoltenVK.a"
+WINEVULKAN_DEFS=""
+WINEVULKAN_OBJS=""
+rm -f "$OBJ_DIR/winevulkan_unixlib.o" "$OBJ_DIR/winevulkan_thunks.o"
+if [ -f "$MOLTENVK_LIB" ]; then
+    echo "=== winevulkan unixlib (MoltenVK present) ==="
+    compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan.c" "winevulkan_unixlib" "winevulkan" \
+        -I"$WINE_SRC/dlls/winevulkan"
+    compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan_thunks.c" "winevulkan_thunks" "winevulkan" \
+        -I"$WINE_SRC/dlls/winevulkan"
+    if [ -f "$OBJ_DIR/winevulkan_unixlib.o" ] && [ -f "$OBJ_DIR/winevulkan_thunks.o" ]; then
+        WINEVULKAN_DEFS="-DMADEIRA_WINEVULKAN=1"
+        WINEVULKAN_OBJS="$OBJ_DIR/winevulkan_unixlib.o $OBJ_DIR/winevulkan_thunks.o"
+    else
+        echo "WARNING: winevulkan unixlib failed; D3D12 stays disabled"
+        for e in "$OBJ_DIR"/winevulkan_*.err; do grep -m 8 'error' "$e" || true; done
+    fi
+else
+    echo "no libMoltenVK.a: winevulkan unixlib skipped"
+fi
+
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
 
@@ -137,7 +165,7 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             compile_one "$BUILD_DIR/cdrom_stub.c" "cdrom"
             ;;
         virtual)
-            compile_one "$BUILD_DIR/virtual_ios.c" "virtual"
+            compile_one "$BUILD_DIR/virtual_ios.c" "virtual" $WINEVULKAN_DEFS
             ;;
         signal_arm64)
             compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64"
@@ -163,7 +191,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/nsi_unixlib_ios.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
-    "$OBJ_DIR/dwrite_unixlib.o" \
+    "$OBJ_DIR/dwrite_unixlib.o" $WINEVULKAN_OBJS \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

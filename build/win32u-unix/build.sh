@@ -25,6 +25,19 @@ FAILED_FILES=""
 
 FREETYPE_DIR="$REPO_ROOT/build/freetype-ios"
 
+# D3D12 path: win32u's Vulkan side is enabled only when MoltenVK is there to
+# link against (app/Madeira/libMoltenVK.a, built by build-full-ipa.yml). Without
+# it vulkan_ios.c compiles to the old "no Vulkan" behaviour and the app links as
+# before.
+MOLTENVK_LIB="$REPO_ROOT/app/Madeira/libMoltenVK.a"
+MOLTENVK_DEFS=""
+if [ -f "$MOLTENVK_LIB" ]; then
+    MOLTENVK_DEFS="-DMADEIRA_MOLTENVK=1"
+    echo "MoltenVK found: win32u Vulkan enabled"
+else
+    echo "no libMoltenVK.a: win32u Vulkan disabled (D3D11 unaffected)"
+fi
+
 compile_one() {
     local src=$1
     local name=$2
@@ -105,6 +118,11 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/message_ios.c" "message"
             continue
             ;;
+        vulkan)
+            # Statically linked MoltenVK (vulkan_ios.c rewrites dlopen/dlsym).
+            compile_one "$BUILD_DIR/vulkan_ios.c" "vulkan" $MOLTENVK_DEFS
+            continue
+            ;;
         freetype)
             # Statically-linked freetype (build/freetype-ios). The wrapper
             # re-defines HAVE_FT2BUILD_H itself; config_ios.h's #undefs win
@@ -118,6 +136,9 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
 
     compile_one "$src" "$name"
 done
+
+# iOS Vulkan surface driver (pVulkanInit slot, see driver_ios.c).
+compile_one "$BUILD_DIR/vulkan_ios_drv.c" "vulkan_ios_drv"
 
 echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"

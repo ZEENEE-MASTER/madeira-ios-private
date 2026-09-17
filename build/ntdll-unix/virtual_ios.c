@@ -5512,6 +5512,14 @@ extern const void *nsi_unix_call_funcs[];
  * never called). Chromium drew no text anywhere as a result. */
 extern const void *dwrite_unix_call_funcs[];
 
+/* D3D12 (vkd3d-proton) path: winevulkan's unix side, compiled into
+ * libntdll_unix.a only when MoltenVK is linked (build.sh sets
+ * MADEIRA_WINEVULKAN). Its host calls go through win32u's vulkan.c to the
+ * statically linked MoltenVK; see build/win32u-unix/vulkan_ios.c. */
+#ifdef MADEIRA_WINEVULKAN
+extern const void *winevulkan_unix_call_funcs[];
+#endif
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -5603,6 +5611,13 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             dprintf(2, "[unixlib] module %p (%s) -> dwrite_unix_call_funcs (%p) rev=ml494\n",
                 module, match, (void *)dwrite_unix_call_funcs);
             status = STATUS_SUCCESS;
+#ifdef MADEIRA_WINEVULKAN
+        } else if (match && strstr(match, "winevulkan")) {
+            *funcs = (const void *)winevulkan_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> winevulkan_unix_call_funcs (%p) MoltenVK\n",
+                module, match, (void *)winevulkan_unix_call_funcs);
+            status = STATUS_SUCCESS;
+#endif
         } else if (match && strstr(match, "nsi.dll")) {
             *funcs = (const void *)nsi_unix_call_funcs;
             dprintf(2, "[unixlib] module %p (%s) -> nsi_unix_call_funcs (%p) rev=ml472\n",

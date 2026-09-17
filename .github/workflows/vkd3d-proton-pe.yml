@@ -21,9 +21,11 @@ name: Build vkd3d-proton (D3D12) for ARM64EC
 # process cannot load a pure-ARM64 DLL. vkd3d-proton ships build-arm64ec.txt for
 # exactly this; it builds ARM64X hybrids (-marm64x), like the Wine PE DLLs.
 #
-# This produces d3d12.dll + d3d12core.dll. It does NOT yet make DX12 work: the
-# Vulkan calls still need winevulkan's UNIX side built for iOS and linked against
-# libMoltenVK.a, which does not exist in Madeira. See BUILD-NOTES.md.
+# This produces d3d12.dll + d3d12core.dll, with Madeira's DXGI swapchain bridge
+# (build/vkd3d-proton-pe/dxgi_bridge.c) compiled into d3d12core.dll: DXMT's
+# dxgi.dll refuses D3D12 queues, so the bridge creates those swapchains itself.
+# The unix half (winevulkan + MoltenVK + the iOS Vulkan surface driver) is built
+# by build-full-ipa.yml, which also calls this workflow.
 
 on:
   workflow_dispatch:
@@ -34,6 +36,14 @@ on:
       llvm_mingw:
         description: "llvm-mingw release tag, or 'latest'"
         default: "latest"
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: "v3.0.1"
+      llvm_mingw:
+        type: string
+        default: "latest"
 
 permissions:
   contents: read
@@ -43,7 +53,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: build/vkd3d-proton-pe
+
+      - name: Restore built DLLs
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: out
+          key: vkd3d-proton-v1-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
+
       - name: Host tools
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -52,6 +75,7 @@ jobs:
           glslangValidator --version | head -1
 
       - name: Install llvm-mingw
+        if: steps.cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -67,11 +91,16 @@ jobs:
           ls "$DIR/bin" | grep -E '^arm64ec-w64-mingw32-(clang|widl|ar|strip)' | sed 's/^/  /'
 
       - name: Clone vkd3d-proton (recursive)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "${{ inputs.ref }}" --recurse-submodules --shallow-submodules \
             https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d
           cd vkd3d && git log --oneline -1
+
+      - name: Madeira DXGI swapchain bridge
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python3 build/vkd3d-proton-pe/apply-bridge.py vkd3d
 
       # vkd3d-proton v3.0.1's shader compilers predate LLVM 23's libc++, which
       # stopped including headers transitively. Two separate failures so far:
@@ -82,6 +111,7 @@ jobs:
       # headers into every C++ translation unit. An older llvm-mingw is not a
       # way round it: 20260519 fails meson's compiler sanity check.
       - name: libc++ compatibility pre-include
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           cat > "$PWD/libcxx-compat.hpp" <<'HPP'
@@ -106,6 +136,7 @@ jobs:
       # provides clang wrappers under those triples, so point at clang
       # explicitly rather than depend on gcc-named aliases existing.
       - name: Cross file for llvm-mingw
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           cat > cross-arm64ec.txt <<'INI'
@@ -134,12 +165,14 @@ jobs:
           sed 's/^/  /' cross-arm64ec.txt
 
       - name: Configure
+        if: steps.cache.outputs.cache-hit != 'true'
         working-directory: vkd3d
         run: |
           set -euo pipefail
           meson setup build --cross-file ../cross-arm64ec.txt --buildtype release -Denable_tests=false -Denable_extras=false 2>&1 | tail -30 || { tail -60 build/meson-logs/meson-log.txt; exit 1; }
 
       - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
         working-directory: vkd3d
         run: |
           set -euo pipefail
@@ -155,7 +188,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          find vkd3d/build -name 'd3d12*.dll' -exec cp {} out/ ';'
+          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
+            find vkd3d/build -name 'd3d12*.dll' -exec cp {} out/ ';'
+            # The bridge must actually be in the binary, not just in the tree.
+            if grep -q 'dxgi bridge: hooked factory vtable' out/d3d12core.dll; then
+              echo "dxgi bridge: present in d3d12core.dll"
+            else
+              echo "::error::dxgi bridge string not found in d3d12core.dll"; exit 1
+            fi
+          fi
           ls -lh out/
           python3 - <<'PY'
           import struct, pathlib
@@ -175,6 +216,13 @@ jobs:
           if not ok:
               raise SystemExit("no d3d12 DLLs produced")
           PY
+
+      - name: Save built DLLs
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: out
+          key: vkd3d-proton-v1-${{ inputs.ref }}-${{ inputs.llvm_mingw }}-${{ hashFiles('build/vkd3d-proton-pe/**') }}
 
       - uses: actions/upload-artifact@v4
         with:
