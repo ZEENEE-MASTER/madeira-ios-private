@@ -31,6 +31,9 @@ on:
       ref:
         description: "vkd3d-proton tag"
         default: "v3.0.1"
+      llvm_mingw:
+        description: "llvm-mingw release (pinned: LLVM 23 rejects dxbc-spirv's small_vector)"
+        default: "20260519"
 
 permissions:
   contents: read
@@ -53,7 +56,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
+          # Pinned to the release contemporary with vkd3d-proton v3.0.1. With
+          # llvm-mingw 20260908 (LLVM 23.1.1) dxbc-spirv's util_small_vector.h
+          # fails: "no matching member function for call to 'move'" -- a
+          # template substitution failure under the newer libc++.
+          URL=$(gh api "repos/mstorsjo/llvm-mingw/releases/tags/${{ inputs.llvm_mingw }}" --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
           if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
           curl -fsSL "$URL" -o /tmp/lm.tar.xz
           sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
