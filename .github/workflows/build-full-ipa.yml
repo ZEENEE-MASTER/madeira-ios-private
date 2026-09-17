@@ -13,6 +13,12 @@ name: Build full IPA from source
 #   44 Wine PE DLLs        wine-pe-dlls.yml   XAudio2 family etc, ARM64X hybrids
 #   x86_64 VC++ runtime    windows runner     WiX bundle defeats 7-Zip
 #
+# Every expensive stage is cached the moment it finishes (cache/save straight
+# after the build step, not at job end), keyed on the submodule commit plus the
+# hash of the scripts that build it. Run 35181977353 spent ~2.5 h reaching the
+# DXMT step and then failed there; with these caches a re-run resumes at the
+# first stage whose inputs changed.
+#
 # Nothing is published. The IPA is a private, expiring artifact.
 
 on:
@@ -53,44 +59,73 @@ jobs:
   pe-dlls:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGETS: "xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7 xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5 xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinput9_1_0 d3d8 d3d10 d3d10_1 ddraw dinput msvcp100 msvcp110 msvcp120 msvcr100 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Cache key
+        id: key
+        run: |
+          WINE_SHA=$(git ls-tree HEAD wine | awk '{print $3}')
+          LIST=$(printf '%s' "$TARGETS" | shasum | cut -c1-12)
+          echo "key=pedlls-v1-${WINE_SHA}-${LIST}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore PE DLLs
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: out
+          key: ${{ steps.key.outputs.key }}
+
       - name: Fetch wine
+        if: steps.cache.outputs.cache-hit != 'true'
         run: git submodule update --init --depth 1 wine
       - name: Host deps
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential flex bison pkg-config gettext autoconf perl python3 curl xz-utils
       - name: Install llvm-mingw
+        if: steps.cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-ubuntu-22.04-x86_64.tar.xz")) | .browser_download_url')
           if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
           curl -fsSL "$URL" -o /tmp/lm.tar.xz
           sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
           echo "$(ls -d /opt/llvm-mingw-* | head -1)/bin" >> "$GITHUB_PATH"
       - name: Configure wine (aarch64 + arm64ec PE)
+        if: steps.cache.outputs.cache-hit != 'true'
         working-directory: wine
         run: |
           ./configure --enable-archs=aarch64,arm64ec --without-x --without-freetype --without-fontconfig --without-alsa --without-oss --without-pulse --without-coreaudio --without-gstreamer --without-opengl --without-vulkan --disable-tests 2>&1 | tail -10
       - name: Build the PE DLLs games miss
+        if: steps.cache.outputs.cache-hit != 'true'
         working-directory: wine
         run: |
-          set -euo pipefail
-          T="xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9 x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7 xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5 xinput1_1 xinput1_2 xinput1_3 xinput1_4 xinput9_1_0 d3d8 d3d10 d3d10_1 ddraw dinput msvcp100 msvcp110 msvcp120 msvcr100 msvcr110 atl100 dxdiagn wbemprox xolehlp winevulkan vulkan-1"
           make -j"$(nproc)" tools 2>&1 | tail -3
           BUILT=0
-          for t in $T; do
+          for t in $TARGETS; do
             if make -j"$(nproc)" "dlls/$t/aarch64-windows/$t.dll" > /tmp/m.log 2>&1; then BUILT=$((BUILT+1)); else echo "FAILED $t"; tail -3 /tmp/m.log; fi
           done
           echo "BUILT: $BUILT"
           mkdir -p ../out
           find dlls -path "*/aarch64-windows/*.dll" -exec cp {} ../out/ ';'
           ls ../out | wc -l
+      - name: Save PE DLLs
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: out
+          key: ${{ steps.key.outputs.key }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: extra-pe-dlls
@@ -102,22 +137,78 @@ jobs:
     needs: [vcruntime, pe-dlls]
     runs-on: macos-latest
     timeout-minutes: 330
+    # Explicit `shell: bash` means -eo pipefail. The implicit default is
+    # `bash -e` WITHOUT pipefail, so `build.sh | tail` used to pass even when
+    # build.sh failed.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Submodules (FEX, wine, dxmt - recursive for their externals)
+      - name: Cache keys
+        id: keys
         run: |
-          set -euo pipefail
-          git submodule update --init --depth 1 FEX wine
-          git submodule update --init --depth 1 --recursive research/dxmt
+          FEX_SHA=$(git ls-tree HEAD FEX | awk '{print $3}')
+          WINE_SHA=$(git ls-tree HEAD wine | awk '{print $3}')
+          DXMT_SHA=$(git ls-tree HEAD research/dxmt | awk '{print $3}')
+          {
+            echo "fex=fexlibs-v1-${FEX_SHA}-${{ hashFiles('build/fex-ios/**') }}"
+            echo "unix=unixlibs-v1-${WINE_SHA}-${{ hashFiles('build/ntdll-unix/**', 'build/win32u-unix/**', 'build/crypto-unix/**', 'build/wineserver/**', 'build/gnutls-ios/**', 'build/freetype-ios/**') }}"
+            echo "dxmt=dxmtlib-v1-${DXMT_SHA}-${{ hashFiles('build/dxmt-ios/**') }}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore FEX libraries
+        id: fex
+        uses: actions/cache/restore@v4
+        with:
+          # The whole build tree minus objects: FEXBridge.mm compiles against
+          # generated headers in build-ios/include, not just the archives.
+          path: |
+            FEX/build-ios
+            !FEX/build-ios/**/*.o
+          key: ${{ steps.keys.outputs.fex }}
+
+      - name: Restore Wine unix libraries
+        id: unix
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libwineserver.a
+          key: ${{ steps.keys.outputs.unix }}
+
+      - name: Restore DXMT library
+        id: dxmt
+        uses: actions/cache/restore@v4
+        with:
+          path: app/Madeira/libdxmt_combined.a
+          key: ${{ steps.keys.outputs.dxmt }}
+
+      - name: Cache status
+        run: |
+          echo "FEX  hit=${{ steps.fex.outputs.cache-hit }}"
+          echo "unix hit=${{ steps.unix.outputs.cache-hit }}"
+          echo "DXMT hit=${{ steps.dxmt.outputs.cache-hit }}"
+
+      - name: Submodules (only those still to build)
+        run: |
+          # FEX always: the app itself compiles against FEX's headers.
+          git submodule update --init --depth 1 FEX
           (cd FEX && git submodule update --init --depth 1 --recursive External 2>&1 | tail -3) || true
-          for d in FEX wine research/dxmt; do echo "  $d $(du -sh "$d" | cut -f1)"; done
+          if [ "${{ steps.unix.outputs.cache-hit }}" != "true" ]; then
+            git submodule update --init --depth 1 wine
+          fi
+          if [ "${{ steps.dxmt.outputs.cache-hit }}" != "true" ]; then
+            git submodule update --init --depth 1 --recursive research/dxmt
+          fi
+          for d in FEX wine research/dxmt; do [ -d "$d/.git" ] || [ -f "$d/.git" ] && echo "  $d $(du -sh "$d" | cut -f1)"; done; true
 
       - name: Xcode 26
         run: |
-          set -euo pipefail
           NEWEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
           sudo xcode-select -s "$NEWEST"
           xcodebuild -version | head -1
@@ -130,25 +221,37 @@ jobs:
           brew install ninja bison flex python-packaging || true
           python3 -c 'import packaging; print("packaging OK")'
 
+      # ---- FEX -----------------------------------------------------------
+      - name: FEXCore for iOS
+        if: steps.fex.outputs.cache-hit != 'true'
+        run: bash build/fex-ios/build.sh 2>&1 | tail -15
+
+      - name: Save FEX libraries
+        if: steps.fex.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          # The whole build tree minus objects: FEXBridge.mm compiles against
+          # generated headers in build-ios/include, not just the archives.
+          path: |
+            FEX/build-ios
+            !FEX/build-ios/**/*.o
+          key: ${{ steps.keys.outputs.fex }}
+
+      # ---- Wine unix side ------------------------------------------------
       - name: llvm-mingw (wine configure needs a PE cross-compiler)
+        if: steps.unix.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           URL=$(gh api repos/mstorsjo/llvm-mingw/releases/latest --jq '.assets[] | select(.name|endswith("ucrt-macos-universal.tar.xz")) | .browser_download_url')
           if [ -z "$URL" ]; then echo "::error::no llvm-mingw asset"; exit 1; fi
           curl -fsSL "$URL" -o /tmp/lm.tar.xz
           sudo mkdir -p /opt && sudo tar -xf /tmp/lm.tar.xz -C /opt
           echo "$(ls -d /opt/llvm-mingw-* | head -1)/bin" >> "$GITHUB_PATH"
 
-      # ---- FEX -----------------------------------------------------------
-      - name: FEXCore for iOS
-        run: bash build/fex-ios/build.sh 2>&1 | tail -15
-
-      # ---- Wine headers --------------------------------------------------
       - name: Wine configure + IDL headers
+        if: steps.unix.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           mkdir -p wine/build-macos && cd wine/build-macos
           ../configure --enable-win64 --without-x --without-freetype --without-fontconfig --without-gstreamer --without-vulkan --without-opengl --without-alsa --without-oss --without-pulse --without-sane --without-usb --without-capi --without-gphoto --disable-tests 2>&1 | tail -5
@@ -159,10 +262,9 @@ jobs:
           done
           echo "IDL headers: $made"
 
-      # ---- Unix libraries ------------------------------------------------
       - name: gnutls + freetype for iOS
+        if: steps.unix.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           if [ ! -d research/freetype ]; then
             git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
           fi
@@ -170,19 +272,30 @@ jobs:
           bash build/freetype-ios/build.sh 2>&1 | tail -3
 
       - name: libntdll_unix.a + libwin32u_unix.a
+        if: steps.unix.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           bash build/ntdll-unix/build.sh 2>&1 | tail -6
           bash build/win32u-unix/build.sh 2>&1 | tail -6
 
       - name: libwineserver.a (base + patches)
+        if: steps.unix.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           bash build/wineserver/make-base.sh 2>&1 | tail -8
           bash build/wineserver/build.sh 2>&1 | tail -8
 
+      - name: Save Wine unix libraries
+        if: steps.unix.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libwineserver.a
+          key: ${{ steps.keys.outputs.unix }}
+
       # ---- DXMT ----------------------------------------------------------
       - name: Restore LLVM 15 for iOS
+        if: steps.dxmt.outputs.cache-hit != 'true'
         id: llvm
         uses: actions/cache/restore@v4
         with:
@@ -190,8 +303,8 @@ jobs:
           key: llvm-ios-llvmorg-15.0.7-v1
 
       - name: LLVM source headers (DXMT includes both build and source trees)
+        if: steps.dxmt.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           if [ "${{ steps.llvm.outputs.cache-hit }}" != "true" ]; then
             echo "::error::LLVM iOS cache miss - run llvm-ios.yml first"; exit 1
           fi
@@ -201,13 +314,27 @@ jobs:
           ls toolchains/llvm-project/llvm/include | head -3
 
       - name: libdxmt_combined.a
+        if: steps.dxmt.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
           xcodebuild -downloadComponent MetalToolchain 2>&1 | tail -2 || true
-          bash build/dxmt-ios/build.sh 2>&1 | tail -10
+          if ! bash build/dxmt-ios/build.sh > /tmp/dxmt.log 2>&1; then
+            tail -30 /tmp/dxmt.log
+            for e in build/dxmt-ios/obj/*.err; do
+              if [ -s "$e" ]; then echo "=== $e"; grep -E 'error' "$e" | head -15 || true; fi
+            done
+            exit 1
+          fi
+          tail -8 /tmp/dxmt.log
           xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
           cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
           ls -lh app/Madeira/libdxmt_combined.a
+
+      - name: Save DXMT library
+        if: steps.dxmt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: app/Madeira/libdxmt_combined.a
+          key: ${{ steps.keys.outputs.dxmt }}
 
       # ---- Assemble ------------------------------------------------------
       - uses: actions/download-artifact@v4
@@ -224,7 +351,6 @@ jobs:
       # are ARM64X hybrids, so the same file serves both directories.
       - name: Merge extra DLLs without overwriting upstream's
         run: |
-          set -euo pipefail
           for dir in aarch64-windows arm64ec-windows; do
             added=0
             for f in extra-dlls/*.dll; do
@@ -237,24 +363,30 @@ jobs:
 
       - name: Every library the app links
         run: |
-          set -euo pipefail
           MISSING=0
-          for f in FEX/build-ios/FEXCore/Source/libFEXCore.a FEX/build-ios/FEXCore/Source/libFEXCore_Base.a FEX/build-ios/FEXCore/Source/libJemallocLibs.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a app/Madeira/libwineserver.a app/Madeira/libdxmt_combined.a; do
+          for f in FEX/build-ios/FEXCore/Source/libFEXCore.a FEX/build-ios/FEXCore/Source/libFEXCore_Base.a FEX/build-ios/FEXCore/Source/libJemallocLibs.a FEX/build-ios/External/fmt/libfmt.a FEX/build-ios/External/cephes/libcephes_128bit.a FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a app/Madeira/libwineserver.a app/Madeira/libdxmt_combined.a app/Madeira/libgnutls.a app/Madeira/libhogweed.a app/Madeira/libnettle.a app/Madeira/libgmp.a; do
             if [ -f "$f" ]; then echo "  OK      $f  $(du -h "$f" | cut -f1)"; else echo "  MISSING $f"; MISSING=1; fi
           done
           if [ "$MISSING" -eq 1 ]; then echo "::error::a linked library is missing"; exit 1; fi
 
       - name: xcodebuild (unsigned)
         run: |
-          set -euo pipefail
-          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -sdk iphoneos -derivedDataPath build-out CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > /tmp/xb.log 2>&1 || { grep -E 'error:|ld: ' /tmp/xb.log | sort -u | head -30; exit 1; }
+          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -sdk iphoneos -derivedDataPath build-out CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > /tmp/xb.log 2>&1 || { grep -E 'error:|ld: |Undefined symbols|duplicate symbol' -A 3 /tmp/xb.log | sort -u | head -60; exit 1; }
           tail -3 /tmp/xb.log
 
       - name: Package IPA
         run: |
-          set -euo pipefail
           APP=$(find build-out/Build/Products -maxdepth 2 -name '*.app' | head -1)
           [ -n "$APP" ] || { echo "::error::no .app"; exit 1; }
+          BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          # IOSDisplayShim.m: if macdrv_functions is not exported, DXMT cannot
+          # find a CAMetalLayer and every D3D11 title exits 3 on a white screen.
+          if xcrun dyld_info -exports "$BIN" 2>/dev/null | grep -q macdrv_functions; then
+            echo "macdrv_functions exported: OK"
+          else
+            echo "::error::macdrv_functions missing from the export trie (DXMT would white-screen)"; exit 1
+          fi
+          echo "DLLs: aarch64 $(ls "$APP/aarch64-windows" | wc -l | tr -d ' '), arm64ec $(ls "$APP/arm64ec-windows" | wc -l | tr -d ' ')"
           rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
           cat > Payload/entitlements.plist <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -267,7 +399,7 @@ jobs:
           PLIST
           zip -qry "Madeira-full-${GITHUB_RUN_NUMBER}.ipa" Payload
           ls -lh Madeira-full-*.ipa
-          echo "binary: $(du -h "$APP/$(basename "$APP" .app)" | cut -f1)"
+          echo "binary: $(du -h "$BIN" | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -278,6 +410,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: xcodebuild-log
-          path: /tmp/xb.log
+          name: build-logs
+          path: |
+            /tmp/xb.log
+            /tmp/dxmt.log
           retention-days: 7
+          if-no-files-found: ignore

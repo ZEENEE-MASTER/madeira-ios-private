@@ -51,6 +51,29 @@ compile_cxx() {
     fi
 }
 
+# airconv_context.cpp #includes air_msad.h, air_samplepos.h, air_tessellation.h.
+# DXMT's meson build generates them (src/airconv/meson.build): each .metal is
+# compiled to AIR bitcode and xxd -i'd into a byte array that airconv links into
+# every converted shader. They were never committed here, so a clean checkout
+# failed on airconv_context alone. Same arguments as meson; the macOS AIR triple
+# is intentional -- airconv stamps converted modules air64-apple-macosx too.
+echo "=== airconv embedded shaders (.metal -> AIR -> xxd header) ==="
+SHADER_HDR_DIR="$BUILD_DIR/shader-headers"
+mkdir -p "$SHADER_HDR_DIR"
+for s in air_msad air_samplepos air_tessellation; do
+    hdr="$SHADER_HDR_DIR/$s.h"
+    if [ -s "$hdr" ]; then echo "  $s.h (exists)"; continue; fi
+    tmp="$(mktemp -d)"
+    xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+        -o "$tmp/$s" -c "$DXMT_SRC/airconv/shaders/$s.metal"
+    # xxd names the array after the input path, so run it on a file called
+    # exactly $s: yields `unsigned char air_msad[]`, which linkShader() takes
+    # by array reference.
+    (cd "$tmp" && xxd -i "$s") > "$hdr"
+    rm -rf "$tmp"
+    echo "  $s.h $(wc -c < "$hdr" | tr -d ' ') bytes"
+done
+
 echo "=== winemetal unix (Objective-C) ==="
 compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
 compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
