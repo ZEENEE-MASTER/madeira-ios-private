@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <mach/mach.h>
 
 #define SLOTS 4
 #define SLOT_SIZE 32
@@ -30,28 +31,112 @@ static uint32_t g_last_rumble[SLOTS];
 static id g_rumble[SLOTS];          // MPRumble
 static dispatch_queue_t g_queue;
 
+#pragma mark - image-base reservation
+
+// Why this exists: a Windows executable built with relocations stripped can
+// ONLY be mapped at its preferred base. Unreal shipping binaries use
+// 0x140000000, and protected ones (Stellar Blade's SB-Win64-Shipping.exe) have
+// no .reloc at all. Madeira's JIT pool is allocated later by StikDebug with
+// VM_FLAGS_ANYWHERE, after pin chunks push the allocator past 0x119000000, so
+// it repeatedly lands across 0x140000000 — and Wine then dies with
+//   wine: failed to create main module ... status c0000018
+// (ntdll's perform_relocations: "need to relocate but there are no relocation
+// records" = STATUS_CONFLICTING_ADDRESSES).
+//
+// So: reserve that band here, at dylib load, long before the pool exists. The
+// pool cannot overlap a reserved range, so the kernel places it elsewhere. The
+// band is released the moment the pool address is published (WINE_IOS_JIT_RX),
+// which is after the pool is allocated and before Wine maps any image.
+//
+// Reserve-only (VM_PROT_NONE, never touched), so it costs address space and no
+// memory. Documents/madeira-imagebase.txt overrides it: "<hex base> <MB>", or
+// "0" to disable.
+
+static vm_address_t g_hold_base = 0x140000000ULL;
+static vm_size_t g_hold_size = 0x20000000ULL;      // 512 MB, covers a 314 MB image
+static BOOL g_hold_active;
+
+static void hold_image_band(void)
+{
+    if (!g_hold_size) return;
+    vm_address_t addr = g_hold_base;
+    // mach_vm_* is not declared in the iOS SDK; vm_* is, and on arm64 its
+    // addresses are already 64-bit.
+    kern_return_t kr = vm_allocate(mach_task_self(), &addr, g_hold_size, VM_FLAGS_FIXED);
+    if (kr != KERN_SUCCESS || addr != g_hold_base) {
+        if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), addr, g_hold_size);
+        fprintf(stderr, "[madeira-pad] image band 0x%llx+%lluMB NOT reserved (kr=%d) — "
+                        "relocation-stripped games may fail with c0000018\n",
+                (unsigned long long)g_hold_base, (unsigned long long)(g_hold_size >> 20), kr);
+        return;
+    }
+    vm_protect(mach_task_self(), addr, g_hold_size, FALSE, VM_PROT_NONE);
+    g_hold_active = YES;
+    fprintf(stderr, "[madeira-pad] image band reserved 0x%llx..0x%llx (JIT pool must go elsewhere)\n",
+            (unsigned long long)g_hold_base, (unsigned long long)(g_hold_base + g_hold_size));
+}
+
+static void release_image_band(const char *pool_rx)
+{
+    if (!g_hold_active) return;
+    vm_deallocate(mach_task_self(), g_hold_base, g_hold_size);
+    g_hold_active = NO;
+    unsigned long long rx = pool_rx ? strtoull(pool_rx, NULL, 16) : 0;
+    const char *verdict = "";
+    if (rx) {
+        // 896 MB default pool; only the overlap verdict matters here.
+        unsigned long long pool_end = rx + (896ULL << 20);
+        verdict = (rx < g_hold_base + g_hold_size && pool_end > g_hold_base)
+                  ? " ** POOL STILL OVERLAPS — relocation-stripped games will fail **" : " (pool clear)";
+    }
+    fprintf(stderr, "[madeira-pad] image band released for the loader; pool RX=%s%s\n",
+            pool_rx ? pool_rx : "?", verdict);
+}
+
 #pragma mark - launch override (setenv / unsetenv interposition)
 
 static NSString *g_override_exe;
 static NSString *g_override_args;
+static BOOL g_override_armed;
+
+// The override hijacks ONE button — "Stray (UE4, -dx11)" — so every other
+// button keeps its own program. Replacing MADEIRA_EXE for all of them also
+// hijacked "Wine Virtual Desktop" and "Steam Testing", which launch
+// explorer.exe: the desktop then started the override's game instead, and
+// looked like a crash.
+static BOOL is_override_target(const char *value)
+{
+    return value && strstr(value, "Stray-Win64-Shipping.exe") != NULL;
+}
 
 static int mp_setenv(const char *name, const char *value, int overwrite)
 {
-    if (name && g_override_exe && !strcmp(name, "MADEIRA_EXE")) {
-        fprintf(stderr, "[madeira-pad] launch override: MADEIRA_EXE %s -> %s\n", value ? value : "(null)", g_override_exe.UTF8String);
-        unsetenv("MADEIRA_DESKTOP");
-        return setenv(name, g_override_exe.UTF8String, 1);
+    if (name && !strcmp(name, "MADEIRA_EXE")) {
+        g_override_armed = g_override_exe && is_override_target(value);
+        if (g_override_armed) {
+            fprintf(stderr, "[madeira-pad] launch override: MADEIRA_EXE %s -> %s\n",
+                    value ? value : "(null)", g_override_exe.UTF8String);
+            unsetenv("MADEIRA_DESKTOP");
+            return setenv(name, g_override_exe.UTF8String, 1);
+        }
     }
-    if (name && g_override_exe && !strcmp(name, "MADEIRA_ARGS")) {
+    if (name && g_override_armed && !strcmp(name, "MADEIRA_ARGS")) {
         if (g_override_args.length) return setenv(name, g_override_args.UTF8String, 1);
         return unsetenv(name);
+    }
+    // The pool exists by the time its address is published: give the loader the
+    // image band back before Wine maps anything.
+    if (name && !strcmp(name, "WINE_IOS_JIT_RX")) {
+        int r = setenv(name, value, overwrite);
+        release_image_band(value);
+        return r;
     }
     return setenv(name, value, overwrite);
 }
 
 static int mp_unsetenv(const char *name)
 {
-    if (name && g_override_exe && !strcmp(name, "MADEIRA_ARGS")) {
+    if (name && g_override_armed && !strcmp(name, "MADEIRA_ARGS")) {
         if (g_override_args.length) return setenv(name, g_override_args.UTF8String, 1);
     }
     return unsetenv(name);
@@ -230,6 +315,18 @@ static void madeira_pad_init(void)
 
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSFileManager *fm = NSFileManager.defaultManager;
+
+        // Before anything else allocates: keep the classic Windows image base free.
+        NSString *ib = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-imagebase.txt"]
+                                                encoding:NSUTF8StringEncoding error:nil];
+        if (ib.length) {
+            NSArray<NSString *> *f = [ib.lowercaseString componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            unsigned long long base = f.count > 0 ? strtoull(f[0].UTF8String, NULL, 16) : 0;
+            unsigned long long mb = f.count > 1 ? strtoull(f[1].UTF8String, NULL, 10) : 512;
+            if (!base) { g_hold_size = 0; fprintf(stderr, "[madeira-pad] image band disabled by madeira-imagebase.txt\n"); }
+            else { g_hold_base = (vm_address_t)base; g_hold_size = (vm_size_t)(mb << 20); }
+        }
+        hold_image_band();
 
         // Persistent caches (Documents is never purged; Library/Caches is).
         NSString *dxmt = [docs stringByAppendingPathComponent:@"madeira-cache/dxmt/"];
