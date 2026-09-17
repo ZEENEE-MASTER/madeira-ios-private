@@ -52,6 +52,10 @@
 		A1000200 /* LogPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000200 /* LogPattern.swift */; };
 		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201 /* LogTail.swift */; };
 		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
+		A1000210 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000210 /* GameLibrary.swift */; };
+		A1000211 /* WineLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000211 /* WineLauncher.swift */; };
+		A1000212 /* LibraryUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000212 /* LibraryUI.swift */; };
+		A1000213 /* GameSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000213 /* GameSession.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -111,6 +115,10 @@
 		A2000200 /* LogPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogPattern.swift; sourceTree = "<group>"; };
 		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
 		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
+		A2000210 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameLibrary.swift; sourceTree = "<group>"; };
+		A2000211 /* WineLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineLauncher.swift; sourceTree = "<group>"; };
+		A2000212 /* LibraryUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryUI.swift; sourceTree = "<group>"; };
+		A2000213 /* GameSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameSession.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -164,6 +172,10 @@
 				A2000200 /* LogPattern.swift */,
 				A2000201 /* LogTail.swift */,
 				A2000202 /* FPSOverlay.swift */,
+				A2000210 /* GameLibrary.swift */,
+				A2000211 /* WineLauncher.swift */,
+				A2000212 /* LibraryUI.swift */,
+				A2000213 /* GameSession.swift */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
 				A200000B /* FEXBridge.mm */,
@@ -313,6 +325,10 @@
 				A1000200 /* LogPattern.swift in Sources */,
 				A1000201 /* LogTail.swift in Sources */,
 				A1000202 /* FPSOverlay.swift in Sources */,
+				A1000210 /* GameLibrary.swift in Sources */,
+				A1000211 /* WineLauncher.swift in Sources */,
+				A1000212 /* LibraryUI.swift in Sources */,
+				A1000213 /* GameSession.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,

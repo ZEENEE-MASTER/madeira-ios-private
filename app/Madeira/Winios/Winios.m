@@ -495,28 +495,39 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
  * what DXMT swapchains use. */
+/* Per-event stderr lines are synchronous writes + fflush on the UI thread for
+ * every touch and key. Useful when debugging input, pure cost otherwise, so
+ * they follow MADEIRA_QUIET like the rest of the hot-path logging. */
+static int winios_input_quiet(void) {
+    /* Latch only once it is ON: MADEIRA_QUIET is set when Wine starts, and a
+     * touch that arrives earlier must not pin logging on for the whole run. */
+    static int q;
+    if (!q) q = getenv("MADEIRA_QUIET") != NULL;
+    return q;
+}
+
 void winios_post_touch_down(int x, int y) {
-    fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
+    if (!winios_input_quiet()) { fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr); }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, 0);
 }
 
 void winios_post_touch_move(int x, int y) {
     static unsigned cnt;
-    if ((cnt++ % 30) == 0) {
+    if ((cnt++ % 30) == 0 && !winios_input_quiet()) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
 }
 
 void winios_post_touch_up(int x, int y) {
-    fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
+    if (!winios_input_quiet()) { fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr); }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, 0);
 }
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
  * 0 for release. Queued like mouse events; drained in pProcessEvents. */
 void winios_post_key(int vk, int down) {
-    fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
+    if (!winios_input_quiet()) { fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr); }
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
 }
 
@@ -551,7 +562,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        if (!quiet) { fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr); }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else

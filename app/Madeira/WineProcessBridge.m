@@ -386,7 +386,14 @@ static void *wine_process_thread(void *arg) {
          * restore the full trace channel set. */
         {
             const char *verbose = getenv("MADEIRA_DEBUG_VERBOSE");
-            if (verbose && *verbose && *verbose != '0') {
+            /* Library launches choose per game: "-all" by default (no channel is
+             * even formatted), or a diagnostic set when the game's verbose
+             * logging switch is on. */
+            const char *launcher_debug = getenv("MADEIRA_WINEDEBUG");
+            if (launcher_debug && *launcher_debug) {
+                setenv("WINEDEBUG", launcher_debug, 1);
+                LOG("WINEDEBUG = %{public}s (per-game, MADEIRA_WINEDEBUG)", launcher_debug);
+            } else if (verbose && *verbose && *verbose != '0') {
                 setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
                 LOG("WINEDEBUG = verbose (MADEIRA_DEBUG_VERBOSE set)");
             } else {
@@ -520,9 +527,15 @@ static void *wine_process_thread(void *arg) {
          * its own environment rather than mutating one process-global set shared by every
          * pseudo-process. This path usually launches explorer.exe and cannot know which
          * title the desktop will start later, so a conditional here cannot work. */
-        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
-        setenv("SteamGameId", "356400", 1);
-        setenv("SteamAppId",  "356400", 1);
+        /* Library launches publish their own title's identity (WineLauncher.plan:
+         * SteamAppPath = the game's folder, SteamAppId only from steam_appid.txt),
+         * which is the per-title design described above. The Thumper defaults stay
+         * for the developer buttons that still rely on them. */
+        if (!getenv("MADEIRA_LAUNCHER")) {
+            setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
+            setenv("SteamGameId", "356400", 1);
+            setenv("SteamAppId",  "356400", 1);
+        }
 
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in

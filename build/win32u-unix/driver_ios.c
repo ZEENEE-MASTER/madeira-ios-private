@@ -1266,23 +1266,35 @@ static UINT winios_UpdateDisplayDevices( const struct gdi_device_manager *manage
     manager->add_source( "winios0", 0x00000005 /* DISPLAY_DEVICE_ATTACHED|PRIMARY */,
                          96 /* dpi */, param );
 
-    /* Single monitor at (0,0)–(1024,768). */
+    /* Screen size: the library launcher sets MADEIRA_SCREEN_W/H to the game's
+     * render size (16:9, full-width or 4:3) and MADEIRA_REFRESH to 60/120, so
+     * titles that size their swapchain from the desktop mode pick a resolution
+     * with the right aspect instead of the legacy 4:3. Unset keeps 1024x768@60,
+     * exactly as before. sysparams_ios.c reads the same variables for the
+     * SM_CXSCREEN family, so metrics and monitor agree. */
+    const char *we = getenv( "MADEIRA_SCREEN_W" ), *he = getenv( "MADEIRA_SCREEN_H" );
+    const char *re = getenv( "MADEIRA_REFRESH" );
+    int sw = (we && atoi( we ) >= 320) ? atoi( we ) : 1024;
+    int sh = (he && atoi( he ) >= 240) ? atoi( he ) : 768;
+    int hz = (re && atoi( re ) >= 30) ? atoi( re ) : 60;
+
     struct gdi_monitor monitor = {
-        .rc_monitor = { 0, 0, 1024, 768 },
-        .rc_work    = { 0, 0, 1024, 768 },
+        .rc_monitor = { 0, 0, sw, sh },
+        .rc_work    = { 0, 0, sw, sh },
         .edid       = NULL,
         .edid_len   = 0,
         .hdr_enabled = FALSE,
     };
     manager->add_monitor( &monitor, param );
 
-    /* Single 1024×768×32 mode at 60 Hz. */
+    /* One real mode; win32u's virtual-mode emulation derives the usual list of
+     * smaller resolutions from it for games that enumerate modes. */
     DEVMODEW current = { .dmSize = sizeof(current) };
     current.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
     current.dmBitsPerPel = 32;
-    current.dmPelsWidth = 1024;
-    current.dmPelsHeight = 768;
-    current.dmDisplayFrequency = 60;
+    current.dmPelsWidth = sw;
+    current.dmPelsHeight = sh;
+    current.dmDisplayFrequency = hz;
     manager->add_modes( &current, 1, &current, param );
 
     return STATUS_SUCCESS;

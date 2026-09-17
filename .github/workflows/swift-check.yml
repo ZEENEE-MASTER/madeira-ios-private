@@ -1,0 +1,46 @@
+name: Swift type-check (fast)
+
+# Type-checks the app's Swift sources against the iOS SDK in a couple of
+# minutes, without FEX, Wine, DXMT or MoltenVK. The bridging header only pulls
+# in system headers, so this catches Swift errors long before a 1-3 hour IPA
+# build would.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "app/Madeira/**/*.swift"
+      - "app/Madeira/Madeira-Bridging-Header.h"
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Xcode 26
+        run: |
+          NEWEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$NEWEST"
+          xcodebuild -version | head -1
+      - name: swiftc -typecheck
+        shell: bash
+        run: |
+          set -o pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun swiftc -typecheck \
+            -sdk "$SDK" -target arm64-apple-ios17.0 -swift-version 5 \
+            -import-objc-header app/Madeira/Madeira-Bridging-Header.h \
+            -I app/Madeira -I app/Madeira/Winios \
+            app/Madeira/*.swift 2>&1 | grep -E 'error:|warning: .*(deprecated|will be an error)' | head -120 || true
+          # Re-run for the exit status (grep above only shapes the log).
+          xcrun swiftc -typecheck \
+            -sdk "$SDK" -target arm64-apple-ios17.0 -swift-version 5 \
+            -import-objc-header app/Madeira/Madeira-Bridging-Header.h \
+            -I app/Madeira -I app/Madeira/Winios \
+            app/Madeira/*.swift > /tmp/tc.log 2>&1

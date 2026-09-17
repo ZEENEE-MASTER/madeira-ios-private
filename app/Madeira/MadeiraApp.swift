@@ -4,7 +4,8 @@ import SwiftUI
 struct MadeiraApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            // SteamOS-style library. The original tooling UI is Developer Tools.
+            RootView()
         }
     }
 }
