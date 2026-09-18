@@ -21,6 +21,129 @@
 #include <mach/mach.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <stdarg.h>
+#include <mach-o/dyld.h>
+
+#pragma mark - own log
+
+// Everything this dylib decides happens in its constructor, before the app
+// redirects stderr into madeira-log.txt, so those lines never reached the log.
+// They go to Documents/madeira-pad-log.txt as well (rewritten every launch).
+static FILE *g_padlog;
+
+static void pad_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void pad_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    if (g_padlog) {
+        va_start(ap, fmt);
+        vfprintf(g_padlog, fmt, ap);
+        va_end(ap);
+        fflush(g_padlog);
+    }
+}
+
+/// Free gaps (>= 16 MB) in the low host range, where the JIT pool and every
+/// fixed-base image have to fit, plus the large mappings between them.
+static void dump_vm_map(const char *when)
+{
+    vm_address_t addr = 0x100000000ULL, prev_end = 0x100000000ULL;
+    unsigned long long free_total = 0;
+    pad_log("[madeira-pad] vm map (%s), 0x100000000..0x7000000000:\n", when);
+    for (int n = 0; n < 4096; n++) {
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        vm_address_t a = addr;
+        if (vm_region_64(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+            a = 0x7000000000ULL, size = 0;
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (a > 0x7000000000ULL) a = 0x7000000000ULL;
+        if (a > prev_end && a - prev_end >= (16ULL << 20)) {
+            pad_log("[madeira-pad]   FREE 0x%llx..0x%llx %6llu MB\n", (unsigned long long)prev_end,
+                    (unsigned long long)a, (unsigned long long)(a - prev_end) >> 20);
+            free_total += a - prev_end;
+        }
+        if (a >= 0x7000000000ULL) break;
+        if (size >= (64ULL << 20))
+            pad_log("[madeira-pad]   used 0x%llx..0x%llx %6llu MB prot=%d/%d\n", (unsigned long long)a,
+                    (unsigned long long)(a + size), (unsigned long long)size >> 20, info.protection, info.max_protection);
+        prev_end = a + size;
+        addr = a + size;
+    }
+    pad_log("[madeira-pad]   %llu MB free in gaps of 16 MB or more\n", free_total >> 20);
+}
+
+#pragma mark - log archive
+
+// The app keeps only madeira-log.txt and madeira-log.prev.txt, and every launch
+// is two processes (the StikDebug JIT request, then the real run), so .prev is
+// always the tiny JIT-request stub and each real run is lost at the next launch.
+// This runs before the app rotates the log: a real run's log (it contains the
+// Wine sequence) is copied to Documents/madeira-logs/<time>-<game>.txt, together
+// with that run's madeira-pad-log.txt. The newest 15 are kept.
+static NSString *log_titles(NSString *path)
+{
+    NSFileHandle *h = [NSFileHandle fileHandleForReadingAtPath:path];
+    NSData *d = [h readDataOfLength:8u << 20];
+    [h closeFile];
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]
+               ?: [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+    if (!s) return nil;
+    static NSSet *system;
+    if (!system) system = [NSSet setWithArray:@[ @"explorer", @"services", @"rpcss", @"winedevice", @"plugplay",
+                                                  @"svchost", @"conhost", @"rundll32", @"start", @"cmd", @"wineboot",
+                                                  @"tabtip", @"steamwebhelper", @"crashreport", @"installermessage" ]];
+    NSMutableOrderedSet *names = [NSMutableOrderedSet orderedSet];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"(?:Target exe: |spawn:L\"|image=L\")[^\\n]*?([A-Za-z0-9 _.+-]+)\\.exe" options:NSRegularExpressionCaseInsensitive error:nil];
+    for (NSTextCheckingResult *m in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)]) {
+        NSString *n = [s substringWithRange:[m rangeAtIndex:1]];
+        NSString *key = n.lowercaseString;
+        if ([system containsObject:key] || [key hasSuffix:@"crashreport"]) continue;
+        [names addObject:[[n stringByReplacingOccurrencesOfString:@" " withString:@"_"] substringToIndex:MIN(n.length, 40u)]];
+        if (names.count >= 3) break;
+    }
+    if ([s rangeOfString:@"Running full Wine sequence"].location == NSNotFound) return nil;   // JIT-request stub
+    return names.count ? [names.array componentsJoinedByString:@"+"] : @"wine";
+}
+
+static void archive_previous_log(NSString *docs)
+{
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *log = [docs stringByAppendingPathComponent:@"madeira-log.txt"];
+    NSDictionary *attr = [fm attributesOfItemAtPath:log error:nil];
+    if (!attr || attr.fileSize < 32 * 1024) return;
+    NSString *titles = log_titles(log);
+    if (!titles) return;
+    NSString *dir = [docs stringByAppendingPathComponent:@"madeira-logs"];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.dateFormat = @"yyyy-MM-dd_HH-mm-ss";
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSString *stem = [NSString stringWithFormat:@"%@-%@", [f stringFromDate:attr.fileModificationDate], titles];
+    NSString *dest = [dir stringByAppendingPathComponent:[stem stringByAppendingString:@".txt"]];
+    if ([fm fileExistsAtPath:dest]) return;
+    [fm copyItemAtPath:log toPath:dest error:nil];
+    NSString *pad = [docs stringByAppendingPathComponent:@"madeira-pad-log.txt"];
+    if ([fm fileExistsAtPath:pad])
+        [fm copyItemAtPath:pad toPath:[dir stringByAppendingPathComponent:[stem stringByAppendingString:@".pad.txt"]] error:nil];
+
+    NSArray *all = [[fm contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    NSMutableArray *logs = [NSMutableArray array];
+    for (NSString *n in all) if (![n hasSuffix:@".pad.txt"]) [logs addObject:n];
+    for (NSUInteger i = 0; i + 15 < logs.count; i++) {
+        NSString *n = logs[i];
+        [fm removeItemAtPath:[dir stringByAppendingPathComponent:n] error:nil];
+        [fm removeItemAtPath:[dir stringByAppendingPathComponent:
+            [[n stringByDeletingPathExtension] stringByAppendingString:@".pad.txt"]] error:nil];
+    }
+}
 
 #define SLOTS 4
 #define SLOT_SIZE 32
@@ -80,6 +203,7 @@ static vm_size_t g_hold_size;
 static BOOL g_hold_active;
 static BOOL g_hold_disabled;
 static unsigned long long g_pool_mb = 896;
+static unsigned long long g_pool_rx;              // WINE_IOS_JIT_RX, once the pool exists
 
 static void hold_image_band(void)
 {
@@ -90,13 +214,13 @@ static void hold_image_band(void)
     kern_return_t kr = vm_allocate(mach_task_self(), &addr, g_hold_size, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS || addr != g_hold_base) {
         if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), addr, g_hold_size);
-        fprintf(stderr, "[madeira-pad] image band 0x%llx+%lluMB NOT reserved (kr=%d)\n",
+        pad_log("[madeira-pad] image band 0x%llx+%lluMB NOT reserved (kr=%d)\n",
                 (unsigned long long)g_hold_base, (unsigned long long)(g_hold_size >> 20), kr);
         return;
     }
     vm_protect(mach_task_self(), addr, g_hold_size, FALSE, VM_PROT_NONE);
     g_hold_active = YES;
-    fprintf(stderr, "[madeira-pad] image band reserved 0x%llx..0x%llx\n",
+    pad_log("[madeira-pad] image band reserved 0x%llx..0x%llx\n",
             (unsigned long long)g_hold_base, (unsigned long long)(g_hold_base + g_hold_size));
 }
 
@@ -105,7 +229,7 @@ static void release_image_band(const char *why)
     if (!g_hold_active) return;
     vm_deallocate(mach_task_self(), g_hold_base, g_hold_size);
     g_hold_active = NO;
-    fprintf(stderr, "[madeira-pad] image band released (%s)\n", why ? why : "?");
+    pad_log("[madeira-pad] image band released (%s)\n", why ? why : "?");
 }
 
 /// Where is the kernel handing out memory right now? Allocate and immediately
@@ -169,10 +293,10 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
         if ([fm fileExistsAtPath:marker]) {
             [fm removeItemAtPath:poolFile error:nil];
             [fm removeItemAtPath:marker error:nil];
-            fprintf(stderr, "[madeira-pad] restored the default JIT pool (no fixed-base target)\n");
+            pad_log("[madeira-pad] restored the default JIT pool (no fixed-base target)\n");
         }
         if (needs_fixed_base && g_hold_disabled)
-            fprintf(stderr, "[madeira-pad] fixed-base handling disabled by madeira-imagebase.txt\n");
+            pad_log("[madeira-pad] fixed-base handling disabled by madeira-imagebase.txt\n");
         return;
     }
 
@@ -196,13 +320,13 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
     // Windows DLL copies and FEX's translated code.
     unsigned long long image_mb = size >> 20;
 
-    fprintf(stderr, "[madeira-pad] %s: ImageBase=0x%llx size=%lluMB relocs-stripped -> must load fixed\n",
+    pad_log("[madeira-pad] %s: ImageBase=0x%llx size=%lluMB relocs-stripped -> must load fixed\n",
             winExe.lastPathComponent.UTF8String, base, size >> 20);
-    fprintf(stderr, "[madeira-pad]   allocator frontier 0x%llx, room below image 0x%llx = %lluMB\n",
+    pad_log("[madeira-pad]   allocator frontier 0x%llx, room below image 0x%llx = %lluMB\n",
             frontier, room, room >> 20);
 
     if (mb < POOL_MIN_MB) {
-        fprintf(stderr, "[madeira-pad]   too little room for a usable pool — leaving everything stock; "
+        pad_log("[madeira-pad]   too little room for a usable pool — leaving everything stock; "
                         "this title cannot load in this layout\n");
         g_hold_size = 0;
         if ([fm fileExistsAtPath:marker]) {
@@ -215,13 +339,13 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
     NSString *existing = [NSString stringWithContentsOfFile:poolFile encoding:NSUTF8StringEncoding error:nil];
     BOOL ours = [fm fileExistsAtPath:marker];
     if (existing.length && !ours) {
-        fprintf(stderr, "[madeira-pad]   keeping your madeira-pool.txt (%s MB)\n",
+        pad_log("[madeira-pad]   keeping your madeira-pool.txt (%s MB)\n",
                 [existing stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].UTF8String);
     } else {
         NSString *value = [NSString stringWithFormat:@"%llu\n", mb];
         [value writeToFile:poolFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [@"written by MadeiraPad.dylib\n" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        fprintf(stderr, "[madeira-pad]   JIT pool set to %lluMB so it ends below the image base "
+        pad_log("[madeira-pad]   JIT pool set to %lluMB so it ends below the image base "
                         "(%lluMB image copy + ~70MB Windows DLLs leaves ~%lldMB for translated code)\n",
                 mb, image_mb, (long long)mb - (long long)image_mb - 70);
         g_pool_mb = mb;
@@ -250,7 +374,7 @@ static int mp_setenv(const char *name, const char *value, int overwrite)
     if (name && !strcmp(name, "MADEIRA_EXE")) {
         g_override_armed = g_override_exe && is_override_target(value);
         if (g_override_armed) {
-            fprintf(stderr, "[madeira-pad] launch override: MADEIRA_EXE %s -> %s\n",
+            pad_log("[madeira-pad] launch override: MADEIRA_EXE %s -> %s\n",
                     value ? value : "(null)", g_override_exe.UTF8String);
             unsetenv("MADEIRA_DESKTOP");
             return setenv(name, g_override_exe.UTF8String, 1);
@@ -262,9 +386,14 @@ static int mp_setenv(const char *name, const char *value, int overwrite)
     }
     if (name && !strcmp(name, "WINE_IOS_JIT_RX") && value) {
         unsigned long long rx = strtoull(value, NULL, 16);
-        fprintf(stderr, "[madeira-pad] JIT pool RX=0x%llx ends 0x%llx, image base 0x%llx (%lld MB of slack)\n",
-                rx, rx + (g_pool_mb << 20), (unsigned long long)g_hold_base,
-                ((long long)g_hold_base - (long long)(rx + (g_pool_mb << 20))) >> 20);
+        g_pool_rx = rx;
+        if (g_hold_base)
+            pad_log("[madeira-pad] JIT pool RX=0x%llx ends 0x%llx, image base 0x%llx (%lld MB of slack)\n",
+                    rx, rx + (g_pool_mb << 20), (unsigned long long)g_hold_base,
+                    ((long long)g_hold_base - (long long)(rx + (g_pool_mb << 20))) >> 20);
+        else
+            pad_log("[madeira-pad] JIT pool RX=0x%llx\n", rx);
+        dump_vm_map("JIT pool placed");
         return setenv(name, value, overwrite);
     }
     return setenv(name, value, overwrite);
@@ -456,7 +585,7 @@ static void connect_pad(GCController *c)
     c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *gp, GCControllerElement *el) { publish(slot); };
     g_rumble[slot] = [[MPRumble alloc] initWithController:c];
     dispatch_async(g_queue, ^{ publish(slot); });
-    fprintf(stderr, "[madeira-pad] controller '%s' -> XInput player %d (rumble=%s)\n",
+    pad_log("[madeira-pad] controller '%s' -> XInput player %d (rumble=%s)\n",
             c.vendorName.UTF8String ?: "?", slot + 1, g_rumble[slot] ? "yes" : "no");
 }
 
@@ -468,7 +597,7 @@ static void disconnect_pad(GCController *c)
         [(MPRumble *)g_rumble[i] stop];
         g_rumble[i] = nil;
         dispatch_async(g_queue, ^{ publish(i); });
-        fprintf(stderr, "[madeira-pad] XInput player %d disconnected\n", i + 1);
+        pad_log("[madeira-pad] XInput player %d disconnected\n", i + 1);
     }
 }
 
@@ -487,31 +616,120 @@ static void pump_rumble(void)
 
 #pragma mark - stall watch
 
-// A protected game (Stellar Blade) reaches its entry point and then spins inside
-// its own unpacking code with no window and no frames. The app can sample guest
-// thread stacks, but only with diagnostics on, and turning them on for the whole
-// run costs real performance (the sampler suspends threads ~500x/s).
+// A protected game reaches its entry point and then spins in its own startup
+// code with no window and no frames (Stellar Blade's demo did that for 13
+// minutes). The app's "diagnostics" switch does not help there — it only gates
+// two log lines — and its watchdog prints the HOST pc, which is somewhere in
+// FEX's translated code and says nothing about the game.
 //
-// So: watch the DXMT present counter. If nothing has ever been presented after
-// the grace period, switch diagnostics on once, so the log captures WHERE the
-// guest is stuck. If a frame arrives first, this never fires.
+// So: watch the DXMT present counter, and if nothing has been presented after
+// the grace period, sample every thread that is running translated code and
+// print its GUEST x86-64 state. In FEX's arm64 JIT x28 holds the CPU state
+// pointer; RIP is at +0x18 (block-granular) and the 16 GPRs at +0x20 — the
+// same layout the Wine side reads for [int3-guest]. A loop shows up as the
+// same few RIPs over and over; resolve them against the [jit-pool] image lines.
 // Documents/madeira-stallwatch.txt holds the seconds, or "0" to disable.
 
 static int g_stall_seconds = 45;
-static BOOL g_stall_fired;
 static uint64_t (*g_get_presents)(void);
-static void (*g_set_diag)(int);
+
+#define RIP_SLOTS 64
+static struct { uint64_t rip; unsigned hits; } g_rips[RIP_SLOTS];
+static unsigned g_samples;
+
+static BOOL read_mem(uint64_t addr, void *out, size_t len)
+{
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)out, &got) == KERN_SUCCESS
+        && got == len;
+}
+
+static void note_rip(uint64_t rip)
+{
+    for (int i = 0; i < RIP_SLOTS; i++) {
+        if (g_rips[i].rip == rip) { g_rips[i].hits++; return; }
+        if (!g_rips[i].rip) { g_rips[i].rip = rip; g_rips[i].hits = 1; return; }
+    }
+}
+
+static void sample_guest_threads(BOOL verbose)
+{
+    if (!g_pool_rx) return;
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) return;
+    thread_t self = mach_thread_self();
+    unsigned in_jit = 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        if (threads[i] == self) continue;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        // For another thread XNU stops it for the copy and resumes it: no
+        // explicit suspend, so no risk of freezing a thread that holds a lock
+        // this code then needs.
+        if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) continue;
+        uint64_t pc = arm_thread_state64_get_pc(st);
+        if (pc < g_pool_rx || pc >= g_pool_rx + (1200ULL << 20)) continue;   // not in the JIT pool
+        uint64_t state = st.__x[28], rip = 0, g[16];
+        if (state < 0x100000000ULL || !read_mem(state + 0x18, &rip, 8) || !read_mem(state + 0x20, g, sizeof(g))) {
+            if (verbose) pad_log("[madeira-pad]   thread #%u native pc=pool+0x%llx (Arm64EC/Wine code, not guest x86)\n",
+                                 i, (unsigned long long)(pc - g_pool_rx));
+            continue;
+        }
+        in_jit++;
+        note_rip(rip);
+        if (verbose)
+            pad_log("[madeira-pad]   thread #%u guest RIP=0x%llx RSP=0x%llx RAX=%llx RCX=%llx RDX=%llx RBX=%llx "
+                    "RBP=%llx RSI=%llx RDI=%llx R8=%llx R9=%llx (host pc=pool+0x%llx)\n",
+                    i, (unsigned long long)rip, (unsigned long long)g[4], (unsigned long long)g[0],
+                    (unsigned long long)g[1], (unsigned long long)g[2], (unsigned long long)g[3],
+                    (unsigned long long)g[5], (unsigned long long)g[6], (unsigned long long)g[7],
+                    (unsigned long long)g[8], (unsigned long long)g[9], (unsigned long long)(pc - g_pool_rx));
+    }
+    for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), threads[i]);
+    mach_port_deallocate(mach_task_self(), self);
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(thread_t));
+    g_samples++;
+    if (verbose) pad_log("[madeira-pad]   %u of %u threads were in translated guest code\n", in_jit, n);
+}
+
+static void print_rip_histogram(void)
+{
+    pad_log("[madeira-pad] guest RIP histogram after %u samples (hits, RIP) — a spin loop is the top few:\n", g_samples);
+    for (int shown = 0; shown < 12; shown++) {
+        int best = -1;
+        for (int i = 0; i < RIP_SLOTS; i++)
+            if (g_rips[i].rip && g_rips[i].hits && (best < 0 || g_rips[i].hits > g_rips[best].hits)) best = i;
+        if (best < 0) break;
+        pad_log("[madeira-pad]   %5u  0x%llx\n", g_rips[best].hits, (unsigned long long)g_rips[best].rip);
+        g_rips[best].hits = 0;           // consumed; the slot stays so the RIP is not re-added
+    }
+    memset(g_rips, 0, sizeof(g_rips));
+}
 
 static void stall_tick(void)
 {
-    static int elapsed;
-    if (g_stall_fired || g_stall_seconds <= 0 || !g_get_presents || !g_set_diag) return;
-    if (g_get_presents() > 0) { g_stall_fired = YES; return; }   // it drew something: stay quiet
+    static int elapsed, since;
+    static BOOL announced;
+    if (g_stall_seconds <= 0 || !g_get_presents || !g_pool_rx) return;
+    if (g_get_presents() > 0) {
+        if (announced) { pad_log("[madeira-pad] first frame presented — sampler stopped\n"); announced = NO; }
+        g_stall_seconds = 0;             // it drew something: stay quiet for the rest of the run
+        return;
+    }
     if (++elapsed < g_stall_seconds) return;
-    g_stall_fired = YES;
-    g_set_diag(1);
-    fprintf(stderr, "[madeira-pad] no frame after %ds — diagnostics ON; thread stacks follow "
-                    "(this is where the guest is spinning)\n", g_stall_seconds);
+    if (!announced) {
+        announced = YES;
+        pad_log("[madeira-pad] no frame after %ds — sampling guest threads (every second, "
+                "full dump every 30 s)\n", g_stall_seconds);
+        dump_vm_map("stalled");
+        sample_guest_threads(YES);
+        return;
+    }
+    since++;
+    BOOL full = (since % 30) == 0;
+    sample_guest_threads(full);
+    if (full) print_rip_histogram();
 }
 
 #pragma mark - init
@@ -534,6 +752,16 @@ static void madeira_pad_init(void)
 
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSFileManager *fm = NSFileManager.defaultManager;
+
+        // Before the app rotates madeira-log.txt (its LogStore starts after
+        // every dylib constructor), keep the previous real run.
+        archive_previous_log(docs);
+        g_padlog = fopen([docs stringByAppendingPathComponent:@"madeira-pad-log.txt"].fileSystemRepresentation, "w");
+        {
+            NSDateFormatter *f = [NSDateFormatter new];
+            f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+            pad_log("[madeira-pad] ---- process start %s (pid %d) ----\n", [f stringFromDate:NSDate.date].UTF8String, getpid());
+        }
 
         NSString *ib = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-imagebase.txt"]
                                                 encoding:NSUTF8StringEncoding error:nil];
@@ -570,9 +798,9 @@ static void madeira_pad_init(void)
         NSString *sw = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-stallwatch.txt"]
                                                 encoding:NSUTF8StringEncoding error:nil];
         if (sw.length) g_stall_seconds = sw.intValue;
-        // Exported by the app binary (DXMT present counter + diagnostics switch).
+        // Exported by the app binary (DXMT present counter).
         g_get_presents = dlsym(RTLD_DEFAULT, "madeira_get_present_count");
-        g_set_diag = dlsym(RTLD_DEFAULT, "madeira_set_diag_enabled");
+        if (!g_get_presents) pad_log("[madeira-pad] madeira_get_present_count not found — stall sampler off\n");
 
         // Launch override.
         NSString *launch = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-launch.txt"]
@@ -583,13 +811,14 @@ static void madeira_pad_init(void)
             if (exe.length) {
                 g_override_exe = exe;
                 g_override_args = lines.count > 1 ? [lines[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] : @"";
-                fprintf(stderr, "[madeira-pad] madeira-launch.txt: exe=%s args=%s\n", exe.UTF8String, g_override_args.UTF8String);
+                pad_log("[madeira-pad] madeira-launch.txt: exe=%s args=%s\n", exe.UTF8String, g_override_args.UTF8String);
             }
         }
 
         // Pool size and image band depend on what is about to be launched, so
         // this runs after the launch file is read and before anything big is
         // allocated.
+        dump_vm_map("app start");
         plan_for_fixed_base_image(docs, g_override_exe);
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -609,6 +838,6 @@ static void madeira_pad_init(void)
             static dispatch_source_t keep;   // keep the timer alive
             keep = t;
         });
-        fprintf(stderr, "[madeira-pad] loaded: MADEIRA_PAD_SHM=%s\n", addr);
+        pad_log("[madeira-pad] loaded: MADEIRA_PAD_SHM=%s\n", addr);
     }
 }

@@ -130,9 +130,11 @@ def main():
         if not found:
             sys.exit(f"no base IPA in {IPA_DIR}")
         base = found[-1]
-    n = 1
-    while (IPA_DIR / f"Madeira-local-{n}.ipa").exists():
-        n += 1
+    # Next number after the highest one present, so a deleted build's name is
+    # never reused for a newer one.
+    nums = [int(p.stem.rsplit("-", 1)[1]) for p in IPA_DIR.glob("Madeira-local-*.ipa")
+            if p.stem.rsplit("-", 1)[1].isdigit()]
+    n = max(nums, default=0) + 1
     out = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else IPA_DIR / f"Madeira-local-{n}.ipa"
     work = HERE / "work"
     shutil.rmtree(work, ignore_errors=True)
