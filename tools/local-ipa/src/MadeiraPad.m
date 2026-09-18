@@ -353,6 +353,158 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
     hold_image_band();
 }
 
+#pragma mark - ARM64EC data coherence
+
+// Madeira runs every ARM64EC DLL from a copy inside the JIT pool: the whole
+// image is memcpy'd there (virtual_ios.c, "preserves ADRP-based PC-relative
+// references"), so the DLL's own code reads and writes the COPY's .data. The
+// original image stays mapped as well, and that is the address the export
+// table hands to x64 importers. The two are synced one way only (image ->
+// copy, at load), so data a DLL initialises itself never becomes visible to
+// x64 code that imports it.
+//
+// TEKKEN 8 died on exactly that. Wine's msvcp140 constructs std::cout in its
+// DllMain (init_io) — in the pool copy — and one of the game's first static
+// initializers does `std::cout.iword(std::ios_base::xalloc())`: it read the
+// ORIGINAL cout's vbtable pointer, still 0, and faulted at address 0x4. Any
+// x64 program touching cout/cerr/clog/cin, or msvcrt's _iob/_fmode/_environ,
+// is exposed the same way.
+//
+// Fix: right after the copy (Madeira calls sys_icache_invalidate on it),
+// remap the original image's writable sections onto the copy's pages, so the
+// two addresses are one piece of memory. ARM64EC images only (they carry a
+// .hexpthk section): an x64 image's pool copy holds pool-relocated pointers
+// that x64 code must never see, so those stay separate.
+// Documents/madeira-ecdata.txt: module-name prefixes to cover (default
+// "msvcp msvcr"), "all" for every ARM64EC DLL, or "0" to turn this off.
+
+static unsigned long long g_pool_rw, g_pool_size;
+static char g_ecdata_list[256] = "msvcp msvcr";
+static BOOL g_ecdata_all, g_ecdata_off;
+#define ECDATA_MAX 64
+static struct { uint64_t image_va, rx; } g_ecdata_done[ECDATA_MAX];
+static int g_ecdata_count;
+
+extern void sys_icache_invalidate(void *start, size_t len);
+static BOOL read_mem(uint64_t addr, void *out, size_t len);
+
+static BOOL ecdata_wanted(const char *dll)
+{
+    if (g_ecdata_all) return YES;
+    char buf[sizeof(g_ecdata_list)], *save = NULL;
+    strlcpy(buf, g_ecdata_list, sizeof(buf));
+    for (char *t = strtok_r(buf, " \t\r\n,;", &save); t; t = strtok_r(NULL, " \t\r\n,;", &save))
+        if (!strncasecmp(dll, t, strlen(t))) return YES;
+    return NO;
+}
+
+static void ecdata_alias(uint64_t rx, size_t len)
+{
+    const uint8_t *c = (const uint8_t *)(uintptr_t)(g_pool_rw + (rx - g_pool_rx));   // the copy, via the RW alias
+    if (c[0] != 'M' || c[1] != 'Z') return;
+    uint32_t pe;
+    memcpy(&pe, c + 0x3c, 4);
+    if (pe < 0x40 || pe > 0x800 || memcmp(c + pe, "PE\0\0", 4)) return;
+    uint16_t nsec, optsz, magic;
+    memcpy(&nsec, c + pe + 6, 2);
+    memcpy(&optsz, c + pe + 20, 2);
+    const uint8_t *opt = c + pe + 24;
+    memcpy(&magic, opt, 2);
+    if (magic != 0x20b || nsec == 0 || nsec > 96) return;
+    uint32_t soi, hdrs;
+    uint64_t image_va;
+    memcpy(&image_va, opt + 24, 8);
+    memcpy(&soi, opt + 56, 4);
+    memcpy(&hdrs, opt + 60, 4);
+    if (((soi + 0xfffu) & ~0xfffu) != ((len + 0xfff) & ~(size_t)0xfff)) return;   // not this image's copy
+    const uint8_t *sec = opt + optsz;
+    BOOL ec = NO;
+    for (int i = 0; i < nsec; i++) if (!memcmp(sec + i * 40, ".hexpthk", 8)) ec = YES;
+    if (!ec) return;                                                         // x64 or plain ARM64 image
+
+    const char *name = "?";
+    uint32_t exp_rva;
+    memcpy(&exp_rva, opt + 112, 4);
+    if (exp_rva && exp_rva + 16 < soi) {
+        uint32_t nrva;
+        memcpy(&nrva, c + exp_rva + 12, 4);
+        if (nrva && nrva < soi) name = (const char *)(c + nrva);
+    }
+    if (!ecdata_wanted(name)) return;
+    // A later pass may point the copy's header at the pool itself; that is
+    // not an original image.
+    if ((image_va >= g_pool_rx && image_va < g_pool_rx + g_pool_size) ||
+        (image_va >= g_pool_rw && image_va < g_pool_rw + g_pool_size)) return;
+    for (int k = 0; k < g_ecdata_count; k++)
+        if (g_ecdata_done[k].image_va == image_va) {
+            if (g_ecdata_done[k].rx != rx)      // the same copy invalidated again is routine
+                pad_log("[madeira-pad] ecdata: another copy of %s (0x%llx) — the original stays tied to the first one\n",
+                        name, (unsigned long long)image_va);
+            return;
+        }
+
+    // The original must be mapped at the header's ImageBase and match the
+    // copy byte for byte there; anything else means the address is wrong.
+    uint8_t head[0x400];
+    size_t cmp = hdrs && hdrs < sizeof(head) ? hdrs : sizeof(head);
+    if (!read_mem(image_va, head, cmp) || memcmp(head, c, cmp)) {
+        pad_log("[madeira-pad] ecdata: %s — original image not found at 0x%llx, left alone\n",
+                name, (unsigned long long)image_va);
+        return;
+    }
+
+    uint64_t limit_all = ((uint64_t)soi + 0x3fff) & ~0x3fffULL;
+    int aliased = 0;
+    for (int i = 0; i < nsec; i++) {
+        const uint8_t *s = sec + i * 40;
+        uint32_t vsz, va, rsz, ch;
+        memcpy(&vsz, s + 8, 4); memcpy(&va, s + 12, 4); memcpy(&rsz, s + 16, 4); memcpy(&ch, s + 36, 4);
+        if (!(ch & 0x80000000u) || (ch & 0x20000000u)) continue;            // writable, not code
+        uint64_t size = vsz > rsz ? vsz : rsz;
+        if (!size) continue;
+        uint64_t limit = limit_all;
+        for (int j = 0; j < nsec; j++) {
+            uint32_t va2;
+            memcpy(&va2, sec + j * 40 + 12, 4);
+            if (va2 > va && va2 < limit) limit = va2;
+        }
+        uint64_t end = (va + size + 0x3fff) & ~0x3fffULL;
+        if (end > limit) end = limit & ~0x3fffULL;                          // never touch the next section
+        if (((image_va + va) & 0x3fff) || (((uintptr_t)c + va) & 0x3fff) || end <= va) {
+            pad_log("[madeira-pad] ecdata: %s %.8s not on 16 KB pages in both views — skipped\n", name, (const char *)s);
+            continue;
+        }
+        vm_address_t target = (vm_address_t)(image_va + va);
+        vm_prot_t cur = 0, max = 0;
+        kern_return_t kr = vm_remap(mach_task_self(), &target, (vm_size_t)(end - va), 0,
+                                    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                    (vm_address_t)((uintptr_t)c + va), FALSE, &cur, &max, VM_INHERIT_SHARE);
+        if (kr != KERN_SUCCESS || target != (vm_address_t)(image_va + va)) {
+            pad_log("[madeira-pad] ecdata: %s %.8s remap FAILED kr=%d — left as two copies\n", name, (const char *)s, kr);
+            continue;
+        }
+        vm_protect(mach_task_self(), target, (vm_size_t)(end - va), FALSE, VM_PROT_READ | VM_PROT_WRITE);
+        aliased++;
+        pad_log("[madeira-pad] ecdata: %s %.8s 0x%llx+0x%llx now shares the pool copy's pages (0x%llx)\n",
+                name, (const char *)s, (unsigned long long)(image_va + va), (unsigned long long)(end - va),
+                (unsigned long long)(rx + va));
+    }
+    if (aliased && g_ecdata_count < ECDATA_MAX) {
+        g_ecdata_done[g_ecdata_count].image_va = image_va;
+        g_ecdata_done[g_ecdata_count].rx = rx;
+        g_ecdata_count++;
+    }
+}
+
+static void mp_sys_icache_invalidate(void *start, size_t len)
+{
+    sys_icache_invalidate(start, len);
+    uint64_t a = (uint64_t)(uintptr_t)start;
+    if (g_ecdata_off || len < 0x10000 || !g_pool_rx || !g_pool_rw || !g_pool_size) return;
+    if (a < g_pool_rx || a + len > g_pool_rx + g_pool_size) return;
+    ecdata_alias(a, len);
+}
+
 #pragma mark - launch override (setenv / unsetenv interposition)
 
 static NSString *g_override_exe;
@@ -384,6 +536,8 @@ static int mp_setenv(const char *name, const char *value, int overwrite)
         if (g_override_args.length) return setenv(name, g_override_args.UTF8String, 1);
         return unsetenv(name);
     }
+    if (name && value && !strcmp(name, "WINE_IOS_JIT_RW")) g_pool_rw = strtoull(value, NULL, 16);
+    if (name && value && !strcmp(name, "WINE_IOS_JIT_SIZE")) g_pool_size = strtoull(value, NULL, 16);
     if (name && !strcmp(name, "WINE_IOS_JIT_RX") && value) {
         unsigned long long rx = strtoull(value, NULL, 16);
         g_pool_rx = rx;
@@ -465,6 +619,7 @@ __attribute__((used)) static const interpose_t g_interposers[] __attribute__((se
     { (const void *)(unsigned long)&mp_mach_vm_map,      (const void *)(unsigned long)&mach_vm_map },
     { (const void *)(unsigned long)&mp_mach_vm_allocate, (const void *)(unsigned long)&mach_vm_allocate },
     { (const void *)(unsigned long)&mp_vm_allocate,      (const void *)(unsigned long)&vm_allocate },
+    { (const void *)(unsigned long)&mp_sys_icache_invalidate, (const void *)(unsigned long)&sys_icache_invalidate },
 };
 
 #pragma mark - rumble
@@ -801,6 +956,17 @@ static void madeira_pad_init(void)
         // Exported by the app binary (DXMT present counter).
         g_get_presents = dlsym(RTLD_DEFAULT, "madeira_get_present_count");
         if (!g_get_presents) pad_log("[madeira-pad] madeira_get_present_count not found — stall sampler off\n");
+
+        NSString *ecd = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-ecdata.txt"]
+                                                 encoding:NSUTF8StringEncoding error:nil];
+        ecd = [ecd stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (ecd.length) {
+            if ([ecd isEqualToString:@"0"]) g_ecdata_off = YES;
+            else if ([ecd.lowercaseString isEqualToString:@"all"]) g_ecdata_all = YES;
+            else strlcpy(g_ecdata_list, ecd.UTF8String, sizeof(g_ecdata_list));
+        }
+        pad_log("[madeira-pad] ARM64EC data sharing: %s\n",
+                g_ecdata_off ? "off (madeira-ecdata.txt)" : g_ecdata_all ? "all ARM64EC DLLs" : g_ecdata_list);
 
         // Launch override.
         NSString *launch = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-launch.txt"]
