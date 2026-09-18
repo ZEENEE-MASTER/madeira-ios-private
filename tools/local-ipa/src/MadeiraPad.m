@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <mach/mach.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
 
 #define SLOTS 4
 #define SLOT_SIZE 32
@@ -78,6 +79,7 @@ static vm_address_t g_hold_base;
 static vm_size_t g_hold_size;
 static BOOL g_hold_active;
 static BOOL g_hold_disabled;
+static unsigned long long g_pool_mb = 896;
 
 static void hold_image_band(void)
 {
@@ -98,13 +100,12 @@ static void hold_image_band(void)
             (unsigned long long)g_hold_base, (unsigned long long)(g_hold_base + g_hold_size));
 }
 
-static void release_image_band(const char *pool_rx)
+static void release_image_band(const char *why)
 {
     if (!g_hold_active) return;
     vm_deallocate(mach_task_self(), g_hold_base, g_hold_size);
     g_hold_active = NO;
-    fprintf(stderr, "[madeira-pad] image band released for the loader (pool RX=%s)\n",
-            pool_rx ? pool_rx : "?");
+    fprintf(stderr, "[madeira-pad] image band released (%s)\n", why ? why : "?");
 }
 
 /// Where is the kernel handing out memory right now? Allocate and immediately
@@ -182,8 +183,13 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
 
     unsigned long long frontier = probe_frontier();
     unsigned long long pool_start = frontier > FEX_POOL_FLOOR ? frontier : FEX_POOL_FLOOR;
-    pool_start += 32ULL << 20;                       // pin chunks + app allocations still to come
-    unsigned long long room = g_hold_base > pool_start ? g_hold_base - pool_start : 0;
+    // The pool lands somewhere above the frontier once StikJITHelper's pin
+    // chunks and the app's own allocations have run: measured +16 MB and
+    // +55 MB on two launches, so budget 64 MB. A further 32 MB of slack keeps
+    // the pool clear of the image base even at the worst placement.
+    pool_start += 64ULL << 20;
+    unsigned long long room = g_hold_base > pool_start + (32ULL << 20)
+                            ? g_hold_base - pool_start - (32ULL << 20) : 0;
     unsigned long long mb = (room / POOL_GRAIN) * (POOL_GRAIN >> 20);
     if (mb > POOL_MAX_MB) mb = POOL_MAX_MB;
     // The image copy alone is SizeOfImage; what is left is the budget for the
@@ -218,6 +224,7 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
         fprintf(stderr, "[madeira-pad]   JIT pool set to %lluMB so it ends below the image base "
                         "(%lluMB image copy + ~70MB Windows DLLs leaves ~%lldMB for translated code)\n",
                 mb, image_mb, (long long)mb - (long long)image_mb - 70);
+        g_pool_mb = mb;
     }
     hold_image_band();
 }
@@ -253,12 +260,12 @@ static int mp_setenv(const char *name, const char *value, int overwrite)
         if (g_override_args.length) return setenv(name, g_override_args.UTF8String, 1);
         return unsetenv(name);
     }
-    // The pool exists by the time its address is published: give the loader the
-    // image band back before Wine maps anything.
-    if (name && !strcmp(name, "WINE_IOS_JIT_RX")) {
-        int r = setenv(name, value, overwrite);
-        release_image_band(value);
-        return r;
+    if (name && !strcmp(name, "WINE_IOS_JIT_RX") && value) {
+        unsigned long long rx = strtoull(value, NULL, 16);
+        fprintf(stderr, "[madeira-pad] JIT pool RX=0x%llx ends 0x%llx, image base 0x%llx (%lld MB of slack)\n",
+                rx, rx + (g_pool_mb << 20), (unsigned long long)g_hold_base,
+                ((long long)g_hold_base - (long long)(rx + (g_pool_mb << 20))) >> 20);
+        return setenv(name, value, overwrite);
     }
     return setenv(name, value, overwrite);
 }
@@ -271,10 +278,64 @@ static int mp_unsetenv(const char *name)
     return unsetenv(name);
 }
 
+// Hand the image band over at the exact moment Wine's loader asks for that
+// address, not before. Releasing it earlier (when the pool address was
+// published) left a window in which ordinary allocations took the first 12 MB
+// of the range, and the relocation-stripped image then failed with c0000018.
+//
+// On Apple platforms Wine's anon_mmap_tryfixed() reserves with mach_vm_map
+// (VM_FLAGS_FIXED) FIRST and only then mmap()s, so mach_vm_map is the call
+// that matters; the others are covered too in case another path is taken.
+// Only a FIXED request for exactly the image base triggers the release, so an
+// address scan that merely brushes the band cannot hand it away early. While
+// the band is held, ANYWHERE allocations cannot land in it at all.
+extern kern_return_t mach_vm_map(vm_map_t task, uint64_t *address, uint64_t size, uint64_t mask, int flags,
+                                 mach_port_t object, uint64_t offset, boolean_t copy,
+                                 vm_prot_t cur, vm_prot_t max, vm_inherit_t inherit);
+extern kern_return_t mach_vm_allocate(vm_map_t task, uint64_t *address, uint64_t size, int flags);
+
+static inline void release_if_image_base(uint64_t addr, BOOL fixed, const char *via)
+{
+    if (!g_hold_active || !fixed || addr != (uint64_t)g_hold_base) return;
+    char why[96];
+    snprintf(why, sizeof(why), "loader asked for the image base via %s", via);
+    release_image_band(why);
+}
+
+static kern_return_t mp_mach_vm_map(vm_map_t task, uint64_t *address, uint64_t size, uint64_t mask, int flags,
+                                    mach_port_t object, uint64_t offset, boolean_t copy,
+                                    vm_prot_t cur, vm_prot_t max, vm_inherit_t inherit)
+{
+    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_map");
+    return mach_vm_map(task, address, size, mask, flags, object, offset, copy, cur, max, inherit);
+}
+
+static kern_return_t mp_mach_vm_allocate(vm_map_t task, uint64_t *address, uint64_t size, int flags)
+{
+    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_allocate");
+    return mach_vm_allocate(task, address, size, flags);
+}
+
+static kern_return_t mp_vm_allocate(vm_map_t task, vm_address_t *address, vm_size_t size, int flags)
+{
+    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "vm_allocate");
+    return vm_allocate(task, address, size, flags);
+}
+
+static void *mp_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+{
+    release_if_image_base((uint64_t)(uintptr_t)addr, (flags & MAP_FIXED) != 0, "mmap");
+    return mmap(addr, len, prot, flags, fd, offset);
+}
+
 typedef struct { const void *replacement; const void *replacee; } interpose_t;
 __attribute__((used)) static const interpose_t g_interposers[] __attribute__((section("__DATA,__interpose"))) = {
     { (const void *)(unsigned long)&mp_setenv,   (const void *)(unsigned long)&setenv },
     { (const void *)(unsigned long)&mp_unsetenv, (const void *)(unsigned long)&unsetenv },
+    { (const void *)(unsigned long)&mp_mmap,     (const void *)(unsigned long)&mmap },
+    { (const void *)(unsigned long)&mp_mach_vm_map,      (const void *)(unsigned long)&mach_vm_map },
+    { (const void *)(unsigned long)&mp_mach_vm_allocate, (const void *)(unsigned long)&mach_vm_allocate },
+    { (const void *)(unsigned long)&mp_vm_allocate,      (const void *)(unsigned long)&vm_allocate },
 };
 
 #pragma mark - rumble
