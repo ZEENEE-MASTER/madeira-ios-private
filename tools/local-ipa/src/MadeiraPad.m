@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <mach/mach.h>
+#include <dlfcn.h>
 
 #define SLOTS 4
 #define SLOT_SIZE 32
@@ -69,7 +70,7 @@ static dispatch_queue_t g_queue;
 // disable the whole mechanism.
 
 #define FEX_POOL_FLOOR   0x119000000ULL   // StikJITHelper's low bound
-#define POOL_GRAIN       (64ULL << 20)
+#define POOL_GRAIN       (16ULL << 20)   // finer: every MB of pool is FEX headroom
 #define POOL_MIN_MB      256
 #define POOL_MAX_MB      896
 
@@ -181,10 +182,13 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
 
     unsigned long long frontier = probe_frontier();
     unsigned long long pool_start = frontier > FEX_POOL_FLOOR ? frontier : FEX_POOL_FLOOR;
-    pool_start += 64ULL << 20;                       // pin chunks + app allocations still to come
+    pool_start += 32ULL << 20;                       // pin chunks + app allocations still to come
     unsigned long long room = g_hold_base > pool_start ? g_hold_base - pool_start : 0;
     unsigned long long mb = (room / POOL_GRAIN) * (POOL_GRAIN >> 20);
     if (mb > POOL_MAX_MB) mb = POOL_MAX_MB;
+    // The image copy alone is SizeOfImage; what is left is the budget for the
+    // Windows DLL copies and FEX's translated code.
+    unsigned long long image_mb = size >> 20;
 
     fprintf(stderr, "[madeira-pad] %s: ImageBase=0x%llx size=%lluMB relocs-stripped -> must load fixed\n",
             winExe.lastPathComponent.UTF8String, base, size >> 20);
@@ -211,7 +215,9 @@ static void plan_for_fixed_base_image(NSString *docs, NSString *winExe)
         NSString *value = [NSString stringWithFormat:@"%llu\n", mb];
         [value writeToFile:poolFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
         [@"written by MadeiraPad.dylib\n" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        fprintf(stderr, "[madeira-pad]   JIT pool set to %lluMB so it ends below the image base\n", mb);
+        fprintf(stderr, "[madeira-pad]   JIT pool set to %lluMB so it ends below the image base "
+                        "(%lluMB image copy + ~70MB Windows DLLs leaves ~%lldMB for translated code)\n",
+                mb, image_mb, (long long)mb - (long long)image_mb - 70);
     }
     hold_image_band();
 }
@@ -418,6 +424,35 @@ static void pump_rumble(void)
     }
 }
 
+#pragma mark - stall watch
+
+// A protected game (Stellar Blade) reaches its entry point and then spins inside
+// its own unpacking code with no window and no frames. The app can sample guest
+// thread stacks, but only with diagnostics on, and turning them on for the whole
+// run costs real performance (the sampler suspends threads ~500x/s).
+//
+// So: watch the DXMT present counter. If nothing has ever been presented after
+// the grace period, switch diagnostics on once, so the log captures WHERE the
+// guest is stuck. If a frame arrives first, this never fires.
+// Documents/madeira-stallwatch.txt holds the seconds, or "0" to disable.
+
+static int g_stall_seconds = 45;
+static BOOL g_stall_fired;
+static uint64_t (*g_get_presents)(void);
+static void (*g_set_diag)(int);
+
+static void stall_tick(void)
+{
+    static int elapsed;
+    if (g_stall_fired || g_stall_seconds <= 0 || !g_get_presents || !g_set_diag) return;
+    if (g_get_presents() > 0) { g_stall_fired = YES; return; }   // it drew something: stay quiet
+    if (++elapsed < g_stall_seconds) return;
+    g_stall_fired = YES;
+    g_set_diag(1);
+    fprintf(stderr, "[madeira-pad] no frame after %ds — diagnostics ON; thread stacks follow "
+                    "(this is where the guest is spinning)\n", g_stall_seconds);
+}
+
 #pragma mark - init
 
 static void set_default(const char *k, const char *v) { setenv(k, v, 0); }
@@ -463,6 +498,21 @@ static void madeira_pad_init(void)
         set_default("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1");
         set_default("MVK_CONFIG_RESUME_LOST_DEVICE", "1");
 
+        // KUSER_SHARED_DATA clock. Without it SystemTime / InterruptTime /
+        // TickCount never advance, so anything that waits on GetTickCount or
+        // DateTime.UtcNow waits forever — which looks exactly like the black
+        // screen a protected title shows while spinning in its startup code.
+        // Documents/madeira-usd-time.txt still wins (the app sets it with
+        // overwrite), so "0" there turns it back off.
+        set_default("MADEIRA_USD_TIME", "1");
+
+        NSString *sw = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-stallwatch.txt"]
+                                                encoding:NSUTF8StringEncoding error:nil];
+        if (sw.length) g_stall_seconds = sw.intValue;
+        // Exported by the app binary (DXMT present counter + diagnostics switch).
+        g_get_presents = dlsym(RTLD_DEFAULT, "madeira_get_present_count");
+        g_set_diag = dlsym(RTLD_DEFAULT, "madeira_set_diag_enabled");
+
         // Launch override.
         NSString *launch = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-launch.txt"]
                                                      encoding:NSUTF8StringEncoding error:nil];
@@ -489,7 +539,11 @@ static void madeira_pad_init(void)
             for (GCController *c in GCController.controllers) connect_pad(c);
             dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
             dispatch_source_set_timer(t, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_SEC / 100);
-            dispatch_source_set_event_handler(t, ^{ pump_rumble(); });
+            dispatch_source_set_event_handler(t, ^{
+                pump_rumble();
+                static int n;
+                if (++n >= 30) { n = 0; stall_tick(); }      // once a second
+            });
             dispatch_resume(t);
             static dispatch_source_t keep;   // keep the timer alive
             keep = t;
