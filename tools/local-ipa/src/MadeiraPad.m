@@ -505,6 +505,140 @@ static void mp_sys_icache_invalidate(void *start, size_t len)
     ecdata_alias(a, len);
 }
 
+#pragma mark - VM watch (diagnostic)
+
+// TEKKEN 8 (local-7 run): Unreal's persistent linear allocator reserves a big
+// block with VirtualAlloc(MEM_RESERVE|MEM_TOP_DOWN, PAGE_NOACCESS) and treats
+// the returned base as its own. That base came back as 0x7038ba0000 — where
+// Wine had mapped apisetschema.dll read-only at process start — so the game's
+// first write into it faulted and the main thread was killed. Wine's own view
+// tree still shows the apiset file there, so the reservation never really
+// took that range; which host call handed out the address is what this finds.
+//
+// Every host mapping call that touches the watched range (the apiset view,
+// found automatically), and every mapping of 64 MB or more in the guest
+// window, is logged to madeira-pad-log.txt with its result and the calling
+// Madeira functions (symbolised from the app's own symbol table).
+
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <errno.h>
+
+static uint64_t g_watch_lo = 0x7038ba0000ULL, g_watch_hi = 0x7038bd0000ULL;
+static BOOL g_watch_found;
+static int g_vmw_events;
+#define VMW_MAX 600
+static volatile int g_vmw_busy;   // logging in progress (any thread): drop nested hits
+
+typedef struct { uint64_t addr; const char *name; } vmw_sym;
+static vmw_sym *g_syms;
+static uint32_t g_nsyms;
+static BOOL g_syms_tried;
+
+static int vmw_sym_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const vmw_sym *)a)->addr, y = ((const vmw_sym *)b)->addr;
+    return x < y ? -1 : x > y;
+}
+
+static void vmw_load_syms(void)
+{
+    g_syms_tried = YES;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh || mh->filetype != MH_EXECUTE) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const struct load_command *lc = (const struct load_command *)(mh + 1);
+        const struct segment_command_64 *linkedit = NULL;
+        const struct symtab_command *st = NULL;
+        for (uint32_t k = 0; k < mh->ncmds; k++) {
+            if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT"))
+                linkedit = (const struct segment_command_64 *)lc;
+            else if (lc->cmd == LC_SYMTAB)
+                st = (const struct symtab_command *)lc;
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        if (!linkedit || !st) return;
+        uintptr_t le = linkedit->vmaddr + slide - linkedit->fileoff;
+        const struct nlist_64 *nl = (const struct nlist_64 *)(le + st->symoff);
+        const char *strs = (const char *)(le + st->stroff);
+        g_syms = malloc(sizeof(vmw_sym) * st->nsyms);
+        if (!g_syms) return;
+        for (uint32_t k = 0; k < st->nsyms; k++) {
+            if (nl[k].n_type & N_STAB) continue;
+            if ((nl[k].n_type & N_TYPE) != N_SECT || nl[k].n_sect != 1) continue;   // __TEXT,__text
+            g_syms[g_nsyms].addr = nl[k].n_value + slide;
+            g_syms[g_nsyms].name = strs + nl[k].n_un.n_strx;
+            g_nsyms++;
+        }
+        qsort(g_syms, g_nsyms, sizeof(vmw_sym), vmw_sym_cmp);
+        return;
+    }
+}
+
+static const char *vmw_symbolize(uint64_t pc, uint64_t *off)
+{
+    if (!g_syms_tried) vmw_load_syms();
+    if (!g_nsyms || pc < g_syms[0].addr) return NULL;
+    uint32_t lo = 0, hi = g_nsyms;
+    while (hi - lo > 1) {
+        uint32_t mid = (lo + hi) / 2;
+        if (g_syms[mid].addr <= pc) lo = mid; else hi = mid;
+    }
+    *off = pc - g_syms[lo].addr;
+    if (*off > 0x100000) return NULL;                 // past the end of the text section
+    return g_syms[lo].name;
+}
+
+static void vmw_backtrace(void)
+{
+    uint64_t fp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+    for (int i = 0; i < 8 && fp; i++) {
+        uint64_t frame[2];
+        if (!read_mem(fp, frame, sizeof(frame))) break;
+        uint64_t ret = frame[1] & 0x0000007fffffffffULL, off = 0;
+        const char *s = vmw_symbolize(ret, &off);
+        pad_log("[vm-watch]      #%d 0x%llx %s+0x%llx\n", i, (unsigned long long)ret,
+                s ? (s[0] == '_' ? s + 1 : s) : "?", (unsigned long long)off);
+        if (frame[0] <= fp || frame[0] - fp > (8ULL << 20)) break;
+        fp = frame[0];
+    }
+}
+
+static inline BOOL vmw_hits(uint64_t a, uint64_t len)
+{
+    if (!len) return NO;
+    if (a < g_watch_hi && a + len > g_watch_lo) return YES;
+    return len >= (64ULL << 20) && (a == 0 || (a >= 0x7000000000ULL && a < 0x7400000000ULL));
+}
+
+/// One event; `a`/`len` is the request, `res` the address the call produced.
+static void vmw_event(const char *what, uint64_t a, uint64_t len, uint64_t res, long rc, int prot, int flags, int fd)
+{
+    // Address test first: it is pure arithmetic, and all but a handful of
+    // calls stop here.
+    if (!vmw_hits(a, len) && !(res && res != (uint64_t)-1 && vmw_hits(res, len))) return;
+    if (g_vmw_events >= VMW_MAX || !__sync_bool_compare_and_swap(&g_vmw_busy, 0, 1)) return;
+    g_vmw_events++;
+    pad_log("[vm-watch] %s req=0x%llx+0x%llx -> 0x%llx rc=%ld prot=%d flags=0x%x fd=%d%s\n",
+            what, (unsigned long long)a, (unsigned long long)len, (unsigned long long)res, rc, prot, flags, fd,
+            g_vmw_events == VMW_MAX ? " (last one logged)" : "");
+    vmw_backtrace();
+    g_vmw_busy = 0;
+}
+
+/// The apiset view: Wine maps apisetschema.dll (0x30000 bytes) read-only at
+/// process start. Watch wherever it actually lands.
+static void vmw_maybe_found(uint64_t res, size_t len, int prot, int fd)
+{
+    if (g_watch_found || fd < 0 || len != 0x30000 || prot != PROT_READ) return;
+    if (res < 0x7000000000ULL || res >= 0x7400000000ULL) return;
+    g_watch_found = YES;
+    g_watch_lo = res;
+    g_watch_hi = res + len;
+    pad_log("[vm-watch] apiset view candidate at 0x%llx+0x30000 — watching it\n", (unsigned long long)res);
+}
+
 #pragma mark - launch override (setenv / unsetenv interposition)
 
 static NSString *g_override_exe;
@@ -585,30 +719,115 @@ static inline void release_if_image_base(uint64_t addr, BOOL fixed, const char *
     release_image_band(why);
 }
 
+extern kern_return_t mach_vm_deallocate(vm_map_t task, uint64_t address, uint64_t size);
+extern kern_return_t mach_vm_protect(vm_map_t task, uint64_t address, uint64_t size, boolean_t set_max, vm_prot_t prot);
+extern kern_return_t mach_vm_remap(vm_map_t task, uint64_t *target, uint64_t size, uint64_t mask, int flags,
+                                   vm_map_t src_task, uint64_t src, boolean_t copy,
+                                   vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inherit);
+
 static kern_return_t mp_mach_vm_map(vm_map_t task, uint64_t *address, uint64_t size, uint64_t mask, int flags,
                                     mach_port_t object, uint64_t offset, boolean_t copy,
                                     vm_prot_t cur, vm_prot_t max, vm_inherit_t inherit)
 {
-    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_map");
-    return mach_vm_map(task, address, size, mask, flags, object, offset, copy, cur, max, inherit);
+    uint64_t req = address ? *address : 0;
+    if (address) release_if_image_base(req, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_map");
+    kern_return_t kr = mach_vm_map(task, address, size, mask, flags, object, offset, copy, cur, max, inherit);
+    vmw_event("mach_vm_map", req, size, kr == KERN_SUCCESS && address ? *address : 0, kr, cur, flags, object ? 1 : -1);
+    return kr;
 }
 
 static kern_return_t mp_mach_vm_allocate(vm_map_t task, uint64_t *address, uint64_t size, int flags)
 {
-    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_allocate");
-    return mach_vm_allocate(task, address, size, flags);
+    uint64_t req = address ? *address : 0;
+    if (address) release_if_image_base(req, !(flags & VM_FLAGS_ANYWHERE), "mach_vm_allocate");
+    kern_return_t kr = mach_vm_allocate(task, address, size, flags);
+    vmw_event("mach_vm_allocate", req, size, kr == KERN_SUCCESS && address ? *address : 0, kr, 3, flags, -1);
+    return kr;
 }
 
 static kern_return_t mp_vm_allocate(vm_map_t task, vm_address_t *address, vm_size_t size, int flags)
 {
-    if (address) release_if_image_base(*address, !(flags & VM_FLAGS_ANYWHERE), "vm_allocate");
-    return vm_allocate(task, address, size, flags);
+    uint64_t req = address ? *address : 0;
+    if (address) release_if_image_base(req, !(flags & VM_FLAGS_ANYWHERE), "vm_allocate");
+    kern_return_t kr = vm_allocate(task, address, size, flags);
+    vmw_event("vm_allocate", req, size, kr == KERN_SUCCESS && address ? *address : 0, kr, 3, flags, -1);
+    return kr;
 }
 
 static void *mp_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 {
     release_if_image_base((uint64_t)(uintptr_t)addr, (flags & MAP_FIXED) != 0, "mmap");
-    return mmap(addr, len, prot, flags, fd, offset);
+    void *r = mmap(addr, len, prot, flags, fd, offset);
+    int err = errno;
+    if (r != MAP_FAILED) vmw_maybe_found((uint64_t)(uintptr_t)r, len, prot, fd);
+    vmw_event("mmap", (uint64_t)(uintptr_t)addr, len, r == MAP_FAILED ? (uint64_t)-1 : (uint64_t)(uintptr_t)r,
+              r == MAP_FAILED ? err : 0, prot, flags, fd);
+    errno = err;
+    return r;
+}
+
+static int mp_munmap(void *addr, size_t len)
+{
+    int r = munmap(addr, len), err = errno;
+    vmw_event("munmap", (uint64_t)(uintptr_t)addr, len, 0, r ? err : 0, 0, 0, -1);
+    errno = err;
+    return r;
+}
+
+static int mp_mprotect(void *addr, size_t len, int prot)
+{
+    int r = mprotect(addr, len, prot), err = errno;
+    vmw_event("mprotect", (uint64_t)(uintptr_t)addr, len, 0, r ? err : 0, prot, 0, -1);
+    errno = err;
+    return r;
+}
+
+static kern_return_t mp_vm_protect(vm_map_t task, vm_address_t addr, vm_size_t len, boolean_t set_max, vm_prot_t prot)
+{
+    kern_return_t kr = vm_protect(task, addr, len, set_max, prot);
+    vmw_event(set_max ? "vm_protect(max)" : "vm_protect", addr, len, 0, kr, prot, 0, -1);
+    return kr;
+}
+
+static kern_return_t mp_mach_vm_protect(vm_map_t task, uint64_t addr, uint64_t len, boolean_t set_max, vm_prot_t prot)
+{
+    kern_return_t kr = mach_vm_protect(task, addr, len, set_max, prot);
+    vmw_event(set_max ? "mach_vm_protect(max)" : "mach_vm_protect", addr, len, 0, kr, prot, 0, -1);
+    return kr;
+}
+
+static kern_return_t mp_vm_deallocate(vm_map_t task, vm_address_t addr, vm_size_t len)
+{
+    kern_return_t kr = vm_deallocate(task, addr, len);
+    vmw_event("vm_deallocate", addr, len, 0, kr, 0, 0, -1);
+    return kr;
+}
+
+static kern_return_t mp_mach_vm_deallocate(vm_map_t task, uint64_t addr, uint64_t len)
+{
+    kern_return_t kr = mach_vm_deallocate(task, addr, len);
+    vmw_event("mach_vm_deallocate", addr, len, 0, kr, 0, 0, -1);
+    return kr;
+}
+
+static kern_return_t mp_mach_vm_remap(vm_map_t task, uint64_t *target, uint64_t size, uint64_t mask, int flags,
+                                      vm_map_t src_task, uint64_t src, boolean_t copy,
+                                      vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inherit)
+{
+    uint64_t req = target ? *target : 0;
+    kern_return_t kr = mach_vm_remap(task, target, size, mask, flags, src_task, src, copy, cur, max, inherit);
+    vmw_event("mach_vm_remap", req, size, kr == KERN_SUCCESS && target ? *target : 0, kr, cur ? *cur : 0, flags, -1);
+    return kr;
+}
+
+static kern_return_t mp_vm_remap(vm_map_t task, vm_address_t *target, vm_size_t size, vm_address_t mask, int flags,
+                                 vm_map_t src_task, vm_address_t src, boolean_t copy,
+                                 vm_prot_t *cur, vm_prot_t *max, vm_inherit_t inherit)
+{
+    uint64_t req = target ? *target : 0;
+    kern_return_t kr = vm_remap(task, target, size, mask, flags, src_task, src, copy, cur, max, inherit);
+    vmw_event("vm_remap", req, size, kr == KERN_SUCCESS && target ? *target : 0, kr, cur ? *cur : 0, flags, -1);
+    return kr;
 }
 
 typedef struct { const void *replacement; const void *replacee; } interpose_t;
@@ -620,6 +839,14 @@ __attribute__((used)) static const interpose_t g_interposers[] __attribute__((se
     { (const void *)(unsigned long)&mp_mach_vm_allocate, (const void *)(unsigned long)&mach_vm_allocate },
     { (const void *)(unsigned long)&mp_vm_allocate,      (const void *)(unsigned long)&vm_allocate },
     { (const void *)(unsigned long)&mp_sys_icache_invalidate, (const void *)(unsigned long)&sys_icache_invalidate },
+    { (const void *)(unsigned long)&mp_munmap,             (const void *)(unsigned long)&munmap },
+    { (const void *)(unsigned long)&mp_mprotect,           (const void *)(unsigned long)&mprotect },
+    { (const void *)(unsigned long)&mp_vm_protect,         (const void *)(unsigned long)&vm_protect },
+    { (const void *)(unsigned long)&mp_mach_vm_protect,    (const void *)(unsigned long)&mach_vm_protect },
+    { (const void *)(unsigned long)&mp_vm_deallocate,      (const void *)(unsigned long)&vm_deallocate },
+    { (const void *)(unsigned long)&mp_mach_vm_deallocate, (const void *)(unsigned long)&mach_vm_deallocate },
+    { (const void *)(unsigned long)&mp_mach_vm_remap,      (const void *)(unsigned long)&mach_vm_remap },
+    { (const void *)(unsigned long)&mp_vm_remap,           (const void *)(unsigned long)&vm_remap },
 };
 
 #pragma mark - rumble
