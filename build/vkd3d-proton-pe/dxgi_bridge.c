@@ -781,17 +781,20 @@ static HRESULT STDMETHODCALLTYPE bridge_factory_CreateSwapChainForHwnd(IDXGIFact
     IDXGIVkSwapChainFactory *vk_factory;
     HRESULT hr;
 
-    hr = original_CreateSwapChainForHwnd(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swapchain);
-    if (SUCCEEDED(hr) || !device)
+    /* Madeira: a D3D12 command queue exposes IDXGIVkSwapChainFactory. Detect that
+       BEFORE calling dxgi.dll's original, because DXMT's dxgi.dll CRASHES (rather
+       than returning an error) when handed a D3D12 queue instead of a D3D11
+       device — observed on device as an access violation deep in the original
+       CreateSwapChainForHwnd. */
+    if (device && SUCCEEDED(IUnknown_QueryInterface(device, &IID_IDXGIVkSwapChainFactory, (void **)&vk_factory)))
+    {
+        WARN("dxgi bridge: D3D12 queue -> creating the swapchain here (bypassing dxgi.dll).\n");
+        hr = bridge_create_swapchain(factory, vk_factory, hwnd, desc, fullscreen_desc, swapchain);
+        IDXGIVkSwapChainFactory_Release(vk_factory);
         return hr;
+    }
 
-    if (FAILED(IUnknown_QueryInterface(device, &IID_IDXGIVkSwapChainFactory, (void **)&vk_factory)))
-        return hr;
-
-    WARN("dxgi bridge: dxgi.dll refused a D3D12 queue (hr %#x); creating the swapchain here.\n", hr);
-    hr = bridge_create_swapchain(factory, vk_factory, hwnd, desc, fullscreen_desc, swapchain);
-    IDXGIVkSwapChainFactory_Release(vk_factory);
-    return hr;
+    return original_CreateSwapChainForHwnd(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swapchain);
 }
 
 static HRESULT STDMETHODCALLTYPE bridge_factory_CreateSwapChain(IDXGIFactory2 *factory,
@@ -802,12 +805,11 @@ static HRESULT STDMETHODCALLTYPE bridge_factory_CreateSwapChain(IDXGIFactory2 *f
     DXGI_SWAP_CHAIN_DESC1 desc1;
     HRESULT hr;
 
-    hr = original_CreateSwapChain(factory, device, desc, swapchain);
-    if (SUCCEEDED(hr) || !device || !desc)
-        return hr;
-
-    if (FAILED(IUnknown_QueryInterface(device, &IID_IDXGIVkSwapChainFactory, (void **)&vk_factory)))
-        return hr;
+    /* Madeira: detect a D3D12 queue first and bypass dxgi.dll's original, which
+       crashes on a D3D12 queue (see CreateSwapChainForHwnd above). */
+    if (!device || !desc ||
+            FAILED(IUnknown_QueryInterface(device, &IID_IDXGIVkSwapChainFactory, (void **)&vk_factory)))
+        return original_CreateSwapChain(factory, device, desc, swapchain);
 
     memset(&desc1, 0, sizeof(desc1));
     desc1.Width = desc->BufferDesc.Width;
@@ -827,7 +829,7 @@ static HRESULT STDMETHODCALLTYPE bridge_factory_CreateSwapChain(IDXGIFactory2 *f
     fullscreen_desc.Scaling = desc->BufferDesc.Scaling;
     fullscreen_desc.Windowed = desc->Windowed;
 
-    WARN("dxgi bridge: dxgi.dll refused a D3D12 queue in CreateSwapChain (hr %#x); creating it here.\n", hr);
+    WARN("dxgi bridge: D3D12 queue in CreateSwapChain -> creating it here (bypassing dxgi.dll).\n");
     hr = bridge_create_swapchain(factory, vk_factory, desc->OutputWindow, &desc1, &fullscreen_desc,
             (IDXGISwapChain1 **)swapchain);
     IDXGIVkSwapChainFactory_Release(vk_factory);
