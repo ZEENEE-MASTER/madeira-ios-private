@@ -162,3 +162,24 @@ patch(vkd3d / "device.c",
       "        WARN(\"Null descriptor unsupported (MoltenVK); allowing device anyway.\\n\");\n"
       "    }\n",
       "Madeira: no nullDescriptor on MoltenVK")
+
+# Madeira: with the caps gates cleared, device creation now fails inside
+# vkd3d_dstorage_ops_init: MoltenVK cannot compile cs_emit_nv_memory_decompression
+# (SPIRV-Cross emits an atomic on a non-atomic buffer field -> Metal shader
+# compile error 3 -> VK_ERROR_INITIALIZATION_FAILED -> device create fails).
+# GPU DirectStorage decompression is not needed to render, so skip the whole
+# thing. (void) casts keep the now-unused locals from tripping -Werror.
+patch(vkd3d / "meta.c",
+      "    if (!device->device_info.features2.features.shaderInt64)\n"
+      "        return S_OK;\n",
+      "    if (!device->device_info.features2.features.shaderInt64)\n"
+      "        return S_OK;\n"
+      "\n"
+      "    /* Madeira: MoltenVK cannot compile vkd3d's memory-decompression compute\n"
+      "       shaders (atomic on a non-atomic buffer field -> Metal rejects it),\n"
+      "       which failed device creation. DirectStorage GPU decompression is not\n"
+      "       needed to render, so skip these pipelines entirely. */\n"
+      "    (void)required_size; (void)push_range; (void)force_wave32; (void)vr;\n"
+      "    (void)gdeflate_subgroup_ops;\n"
+      "    return S_OK;\n",
+      "Madeira: MoltenVK cannot compile vkd3d's memory-decompression")
