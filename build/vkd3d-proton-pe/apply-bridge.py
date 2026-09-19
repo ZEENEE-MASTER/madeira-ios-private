@@ -126,3 +126,39 @@ patch(vkd3d / "device.c",
       "        WARN(\"Single texel alignment unsupported (MoltenVK); allowing device anyway.\\n\");\n"
       "    }\n",
       "Madeira: MoltenVK lacks single-texel alignment")
+
+# Madeira: this MoltenVK build does not expose VK_EXT_robustness2
+# (robustBufferAccess2 / robustImageAccess2 / nullDescriptor all false), which
+# vkd3d-proton requires. Relax both checks so the device is created, and turn
+# on core 1.0 robustBufferAccess (which MoltenVK does support) so out-of-bounds
+# buffer reads are still bounded. Null-descriptor access remains undefined.
+patch(vkd3d / "device.c",
+      "    if (!physical_device_info->robustness2_features.robustBufferAccess2 ||\n"
+      "            !physical_device_info->robustness2_features.robustImageAccess2)\n"
+      "    {\n"
+      "        ERR(\"Robustness2 features not supported. This is required.\\n\");\n"
+      "        return E_INVALIDARG;\n"
+      "    }\n",
+      "    if (!physical_device_info->robustness2_features.robustBufferAccess2 ||\n"
+      "            !physical_device_info->robustness2_features.robustImageAccess2)\n"
+      "    {\n"
+      "        /* Madeira: MoltenVK lacks VK_EXT_robustness2; fall back to core\n"
+      "           robustBufferAccess so out-of-bounds buffer reads stay bounded. */\n"
+      "        WARN(\"Robustness2 unsupported (MoltenVK); using core robustBufferAccess.\\n\");\n"
+      "        features->robustBufferAccess = VK_TRUE;\n"
+      "    }\n",
+      "Madeira: MoltenVK lacks VK_EXT_robustness2")
+
+patch(vkd3d / "device.c",
+      "    if (!physical_device_info->robustness2_features.nullDescriptor)\n"
+      "    {\n"
+      "        ERR(\"Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\\n\");\n"
+      "        return E_INVALIDARG;\n"
+      "    }\n",
+      "    if (!physical_device_info->robustness2_features.nullDescriptor)\n"
+      "    {\n"
+      "        /* Madeira: no nullDescriptor on MoltenVK; unbound-descriptor access\n"
+      "           is undefined, but let the device come up. */\n"
+      "        WARN(\"Null descriptor unsupported (MoltenVK); allowing device anyway.\\n\");\n"
+      "    }\n",
+      "Madeira: no nullDescriptor on MoltenVK")
