@@ -57,3 +57,33 @@ patch(core / "main.c",
       "        d3d12core_dxgi_bridge_install(dxgi_adapter);\n"
       "    passthrough_unix_environment(\"VKD3D_UNIX_POST_ENV\");\n",
       "d3d12core_dxgi_bridge_install(dxgi_adapter);")
+
+# Madeira: MoltenVK does not implement VK_KHR_cooperative_matrix. vkd3d-proton
+# 3.0.1 loads vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR through the
+# REQUIRED instance-proc macro (the only extension proc that does), so the NULL
+# lookup aborts instance creation entirely and NO D3D12 device is ever created
+# on iOS (confirmed on device: hr 0x80004005, "Failed to load instance procs").
+# Two edits make it degrade gracefully instead:
+#   1. load the proc through the optional macro (every other ext proc uses it)
+#   2. treat cooperative matrix as unsupported when the proc is NULL, so the
+#      capability probe never calls through the NULL pointer
+vkd3d = src / "libs" / "vkd3d"
+
+patch(vkd3d / "vulkan_procs.h",
+      "VK_INSTANCE_PFN(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)",
+      "VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)",
+      "VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)")
+
+patch(vkd3d / "device.c",
+      "    fp8 = device->device_info.shader_float8_features.shaderFloat8CooperativeMatrix == VK_TRUE;\n",
+      "    fp8 = device->device_info.shader_float8_features.shaderFloat8CooperativeMatrix == VK_TRUE;\n"
+      "\n"
+      "    /* Madeira: MoltenVK has no VK_KHR_cooperative_matrix, so the instance\n"
+      "       proc is NULL. Treat cooperative matrix as unsupported instead of\n"
+      "       calling through a NULL pointer. */\n"
+      "    if (!vk_procs->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)\n"
+      "    {\n"
+      "        WARN(\"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR unavailable; disabling cooperative matrix.\\n\");\n"
+      "        return false;\n"
+      "    }\n",
+      "Madeira: MoltenVK has no VK_KHR_cooperative_matrix")
