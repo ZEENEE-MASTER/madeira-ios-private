@@ -1195,6 +1195,28 @@ static void madeira_pad_init(void)
         pad_log("[madeira-pad] ARM64EC data sharing: %s\n",
                 g_ecdata_off ? "off (madeira-ecdata.txt)" : g_ecdata_all ? "all ARM64EC DLLs" : g_ecdata_list);
 
+        // Extra environment. Documents/madeira-env.txt, one KEY=VALUE per line
+        // (# comments and blank lines ignored), each applied with overwrite so
+        // it beats the app's own defaults. This is how vkd3d/MoltenVK/Wine can
+        // be reconfigured — e.g. VKD3D_DEBUG=warn, VKD3D_CONFIG=..., MVK_CONFIG_*
+        // — without rebuilding the app for every experiment. Wine snapshots the
+        // environment when it starts the guest, and this runs first.
+        NSString *envtxt = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-env.txt"]
+                                                     encoding:NSUTF8StringEncoding error:nil];
+        if (envtxt.length) {
+            for (NSString *raw in [envtxt componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+                NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if (!line.length || [line hasPrefix:@"#"]) continue;
+                NSRange eq = [line rangeOfString:@"="];
+                if (eq.location == NSNotFound || eq.location == 0) continue;
+                NSString *k = [[line substringToIndex:eq.location] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                NSString *v = [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if (!k.length) continue;
+                setenv(k.UTF8String, v.UTF8String, 1);
+                pad_log("[madeira-pad] env: %s=%s (madeira-env.txt)\n", k.UTF8String, v.UTF8String);
+            }
+        }
+
         // Launch override.
         NSString *launch = [NSString stringWithContentsOfFile:[docs stringByAppendingPathComponent:@"madeira-launch.txt"]
                                                      encoding:NSUTF8StringEncoding error:nil];
