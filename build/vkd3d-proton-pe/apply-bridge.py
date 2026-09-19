@@ -109,3 +109,20 @@ patch(vkd3d / "device.c",
       "        physical_device_info->xfb_features.transformFeedback = VK_FALSE;\n"
       "    }\n",
       "Madeira: MoltenVK has no transform feedback")
+
+# Madeira: MoltenVK reports coarser texel-buffer offset alignment than "single
+# texel", which vkd3d-proton 3.0.1 treats as a hard requirement (E_INVALIDARG).
+# Relax it so the device is created; typed-buffer views at arbitrary byte
+# offsets may be affected, but that is rare and not worth blocking all of DX12.
+patch(vkd3d / "device.c",
+      "    if (!single_storage_texel || !single_uniform_texel)\n"
+      "    {\n"
+      "        ERR(\"Lacking support for single texel alignment.\\n\");\n"
+      "        return E_INVALIDARG;\n"
+      "    }\n",
+      "    if (!single_storage_texel || !single_uniform_texel)\n"
+      "    {\n"
+      "        /* Madeira: MoltenVK lacks single-texel alignment; allow the device. */\n"
+      "        WARN(\"Single texel alignment unsupported (MoltenVK); allowing device anyway.\\n\");\n"
+      "    }\n",
+      "Madeira: MoltenVK lacks single-texel alignment")
