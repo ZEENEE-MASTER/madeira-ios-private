@@ -87,3 +87,25 @@ patch(vkd3d / "device.c",
       "        return false;\n"
       "    }\n",
       "Madeira: MoltenVK has no VK_KHR_cooperative_matrix")
+
+# Madeira: MoltenVK has no transform feedback (VK_EXT_transform_feedback backs
+# D3D12 stream output). vkd3d-proton 3.0.1 treats it as a hard device-caps
+# requirement and returns E_INVALIDARG, so D3D12CreateDevice fails on iOS even
+# though the instance + physical device now come up. Make it non-fatal: disable
+# stream output and let the device be created. Games that use stream output /
+# geometry-shader SO will lack it; everything else runs.
+patch(vkd3d / "device.c",
+      "    if (!physical_device_info->xfb_properties.transformFeedbackQueries)\n"
+      "    {\n"
+      "        ERR(\"Lacking support for transform feedback.\\n\");\n"
+      "        return E_INVALIDARG;\n"
+      "    }\n",
+      "    if (!physical_device_info->xfb_properties.transformFeedbackQueries)\n"
+      "    {\n"
+      "        /* Madeira: MoltenVK has no transform feedback. D3D12 stream output\n"
+      "           is unavailable, but let the device come up so everything else runs. */\n"
+      "        WARN(\"Transform feedback unsupported (MoltenVK); stream output disabled.\\n\");\n"
+      "        vulkan_info->EXT_transform_feedback = false;\n"
+      "        physical_device_info->xfb_features.transformFeedback = VK_FALSE;\n"
+      "    }\n",
+      "Madeira: MoltenVK has no transform feedback")
