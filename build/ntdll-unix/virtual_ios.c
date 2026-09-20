@@ -11297,26 +11297,37 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
                             sec[i].Characteristics );
             if (map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
-                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
+                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) == STATUS_SUCCESS)
             {
-                ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
-                do { IOS_IMG_FAIL(8); goto done; } while (0);
+                /* check if the import directory falls inside this section */
+                if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
+                    imports->VirtualAddress < sec[i].VirtualAddress + map_size)
+                {
+                    UINT_PTR base = imports->VirtualAddress & ~host_page_mask;
+                    UINT_PTR end = base + ROUND_SIZE( imports->VirtualAddress, imports->Size, host_page_mask );
+                    if (end > sec[i].VirtualAddress + map_size) end = sec[i].VirtualAddress + map_size;
+                    if (end > base)
+                        map_file_into_view( view, shared_fd, base, end - base,
+                                            pos + (base - sec[i].VirtualAddress),
+                                            VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE );
+                }
+                pos += map_size;
+                continue;
             }
 
-            /* check if the import directory falls inside this section */
-            if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
-                imports->VirtualAddress < sec[i].VirtualAddress + map_size)
-            {
-                UINT_PTR base = imports->VirtualAddress & ~host_page_mask;
-                UINT_PTR end = base + ROUND_SIZE( imports->VirtualAddress, imports->Size, host_page_mask );
-                if (end > sec[i].VirtualAddress + map_size) end = sec[i].VirtualAddress + map_size;
-                if (end > base)
-                    map_file_into_view( view, shared_fd, base, end - base,
-                                        pos + (base - sec[i].VirtualAddress),
-                                        VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE );
-            }
+            /* iOS-Madeira ml761: iOS cannot back a MAP_SHARED writable section
+             * (no wineserver shared fd usable with MAP_SHARED|MAP_FIXED at the
+             * guest VA inside the JIT pool), which previously failed the whole
+             * image with INVALID_IMAGE_FORMAT (reject #8). A shared+writable
+             * section exists for cross-process coherency, which single-process
+             * apps never rely on, so map it PRIVATELY (copy-on-write) instead of
+             * refusing to load. Fall through to the normal private-section path
+             * below; keep `pos` advanced in case a later section still uses
+             * shared_fd. */
+            WARN_(module)( "%s shared+writable section %.8s: no iOS shared backing, mapping private (copy-on-write)\n",
+                           debugstr_us(nt_name), sec[i].Name );
             pos += map_size;
-            continue;
+            /* fall through to private mapping */
         }
 
         TRACE_(module)( "mapping %s section %.8s at %p off %x size %x virt %x flags %x\n",
