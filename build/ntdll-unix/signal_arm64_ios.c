@@ -2533,21 +2533,39 @@ static void *ios_mach_exception_thread( void *arg )
                  * that never got dual-mapped. Capped. */
                 if (!rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
+                    /* iOS-Madeira ml760: a store/atomic fault with NO pool/anon
+                     * alias on a page that is WRITABLE-CAPABLE (max has W) but
+                     * currently downgraded to r-x is a guest region the app owns
+                     * and uses as DATA with atomics -- e.g. UE5 FMallocBinned lock
+                     * words (TEKKEN 8 demo: STLXR 0xc89ffcc8 into its own ~25MB
+                     * RWX region). FEX only dual-maps its own JIT pool, so there is
+                     * no RW alias to redirect to, and exclusive stores (STLXR) can
+                     * NOT be value-emulated like a plain STR. Fix: promote the page
+                     * to PROT_READ|PROT_WRITE (drop EXEC) and let the instruction
+                     * re-execute natively -- anonymous guest memory supports
+                     * exclusives once writable. If the app later executes there,
+                     * the existing exec-recover path (ml133/ml694 below) re-adds
+                     * EXEC; a per-page repeat guard stops a W^X ping-pong from
+                     * spinning forever. Query the region unconditionally (not just
+                     * for the capped log). */
+                    mach_vm_address_t na = (mach_vm_address_t)fault_addr;
+                    mach_vm_size_t ns = 0;
+                    vm_region_basic_info_data_64_t ni;
+                    mach_msg_type_number_t nc = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t no = MACH_PORT_NULL;
+                    uint32_t ninsn = 0;
+                    mach_vm_size_t ngot = 0;
+                    kern_return_t rkr = mach_vm_region(mach_task_self(), &na, &ns,
+                                           VM_REGION_BASIC_INFO_64,
+                                           (vm_region_info_t)&ni, &nc, &no);
+                    mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fault_pc, 4,
+                                           (mach_vm_address_t)&ninsn, &ngot);
+
                     static int noalias_n;
                     if (noalias_n < 8)
                     {
-                        mach_vm_address_t na = (mach_vm_address_t)fault_addr;
-                        mach_vm_size_t ns = 0;
-                        vm_region_basic_info_data_64_t ni;
-                        mach_msg_type_number_t nc = VM_REGION_BASIC_INFO_COUNT_64;
-                        mach_port_t no = MACH_PORT_NULL;
-                        uint32_t ninsn = 0;
-                        mach_vm_size_t ngot = 0;
                         noalias_n++;
-                        mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fault_pc, 4,
-                                               (mach_vm_address_t)&ninsn, &ngot);
-                        if (mach_vm_region(mach_task_self(), &na, &ns, VM_REGION_BASIC_INFO_64,
-                                           (vm_region_info_t)&ni, &nc, &no) == KERN_SUCCESS)
+                        if (rkr == KERN_SUCCESS)
                             dprintf(STDERR_FILENO,
                                 "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
                                 "NO pool/anon alias | region 0x%llx+0x%llx prot=%d max=%d "
@@ -2562,6 +2580,41 @@ static void *ios_mach_exception_thread( void *arg )
                                 "NO alias and NO region (unmapped) — genuine bad pointer\n",
                                 noalias_n, (unsigned long long)fault_addr, ninsn,
                                 (unsigned long long)fault_pc);
+                    }
+
+                    /* ml760: promote-and-retry for RWX-capable downgraded pages. */
+                    if (rkr == KERN_SUCCESS && (ni.max_protection & VM_PROT_WRITE)
+                            && !(ni.protection & VM_PROT_WRITE))
+                    {
+                        /* Per-page repeat guard: if the same page keeps faulting
+                         * after we promote it, the promotion isn't sticking, so
+                         * stop retrying and fall through (avoids an infinite W^X
+                         * ping-pong). Small ring of recent pages. */
+                        static uint64_t promo_pg[16];
+                        static uint8_t  promo_hit[16];
+                        uint64_t pg = (uint64_t)fault_addr & ~0x3fffULL;
+                        int slot = (int)((pg >> 14) & 15), spin = 0;
+                        if (promo_pg[slot] == pg) {
+                            if (promo_hit[slot] >= 4) spin = 1;   /* give up on this page */
+                            else promo_hit[slot]++;
+                        } else {
+                            promo_pg[slot] = pg;
+                            promo_hit[slot] = 1;
+                        }
+                        if (!spin &&
+                            mprotect((void *)(uintptr_t)pg, 0x4000, PROT_READ | PROT_WRITE) == 0)
+                        {
+                            static int promo_log;
+                            if (promo_log < 16) {
+                                promo_log++;
+                                dprintf(STDERR_FILENO,
+                                    "[store-promote] rev=ml760 page 0x%llx -> RW (was prot=%d max=%d) "
+                                    "for guest atomic/store insn=0x%08x — retrying natively\n",
+                                    (unsigned long long)pg, ni.protection, ni.max_protection,
+                                    ninsn);
+                            }
+                            handled = 1;   /* re-execute the faulting instruction */
+                        }
                     }
                 }
                 if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
